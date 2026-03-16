@@ -1,0 +1,11 @@
+[package]
+name = "zkvm-verifier"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+toyni = { workspace = true }
+zkvm-core = { workspace = true }
+zkvm-air = { workspace = true }
+zkvm-prover = { workspace = true }
+sha2 = { workspace = true }

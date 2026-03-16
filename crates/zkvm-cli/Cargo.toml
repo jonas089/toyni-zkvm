@@ -1,0 +1,17 @@
+[package]
+name = "zkvm-cli"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+cuda = ["zkvm-prover/cuda"]
+
+[dependencies]
+toyni = { workspace = true }
+zkvm-core = { workspace = true }
+zkvm-air = { workspace = true }
+zkvm-prover = { workspace = true }
+zkvm-verifier = { workspace = true }
+zkvm-io = { workspace = true }
+sha2 = { workspace = true }

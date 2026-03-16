@@ -1,0 +1,8 @@
+[package]
+name = "zkvm-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+toyni = { workspace = true }
+sha2 = { workspace = true }

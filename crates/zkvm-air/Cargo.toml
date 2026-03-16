@@ -1,0 +1,8 @@
+[package]
+name = "zkvm-air"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+toyni = { workspace = true }
+zkvm-core = { workspace = true }

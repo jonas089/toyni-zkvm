@@ -1,0 +1,11 @@
+[package]
+name = "zkvm-io"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["std"]
+std = ["dep:zkvm-core"]
+
+[dependencies]
+zkvm-core = { workspace = true, optional = true }

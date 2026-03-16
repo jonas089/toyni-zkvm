@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "crates/zkvm-core",
+    "crates/zkvm-air",
+    "crates/zkvm-prover",
+    "crates/zkvm-verifier",
+    "crates/zkvm-io",
+    "crates/zkvm-cli",
+    "crates/zkvm-host",
+    "examples/fibonacci-rust/host",
+]
+exclude = [
+    "crates/zkvm-guest",
+    "examples/fibonacci-rust/guest",
+]
+resolver = "2"
+
+[workspace.dependencies]
+toyni = { path = "../toyni" }
+zkvm-core = { path = "crates/zkvm-core" }
+zkvm-air = { path = "crates/zkvm-air" }
+zkvm-prover = { path = "crates/zkvm-prover" }
+zkvm-verifier = { path = "crates/zkvm-verifier" }
+zkvm-host = { path = "crates/zkvm-host" }
+zkvm-io = { path = "crates/zkvm-io", default-features = true }
+sha2 = "0.10.8"

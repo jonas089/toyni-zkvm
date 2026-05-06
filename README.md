@@ -20,6 +20,12 @@ A small RISC-V (RV32I) zero-knowledge virtual machine, built on
   prover is unsound** and treat the project purely as a learning /
   research artefact.
 
+Getting an RV32I constraint system right end-to-end is genuinely
+ambitious for a single person. I'm working on it as a side project,
+and external contributions, reviews, and bug reports are very welcome.
+Open an issue or PR if you want to help close any of the gaps above
+(or any others you spot).
+
 ## Architecture overview
 
 ```mermaid
@@ -81,7 +87,7 @@ than the AIR itself.
 | `zkvm-core` | RV32I CPU emulator, ELF loader, trace generation, column layout |
 | `zkvm-air` | Transition + permutation constraints over the trace columns |
 | `zkvm-prover` | Two-phase commit → quotient → DEEP → FRI pipeline |
-| `zkvm-verifier` | Fiat–Shamir replay, OOD constraint check, FRI query verification |
+| `zkvm-verifier` | Fiat-Shamir replay, OOD constraint check, FRI query verification |
 | `zkvm-io` | Public input / output tape helpers |
 | `zkvm-host` | Host-side helpers shared by examples |
 | `zkvm-cli` | `prove` / `verify` command-line entry point |

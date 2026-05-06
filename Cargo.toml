@@ -8,12 +8,10 @@ members = [
     "crates/zkvm-cli",
     "crates/zkvm-host",
     "examples/fibonacci-rust/host",
-    "examples/heavy-rust/host",
 ]
 exclude = [
     "crates/zkvm-guest",
     "examples/fibonacci-rust/guest",
-    "examples/heavy-rust/guest",
 ]
 resolver = "2"
 

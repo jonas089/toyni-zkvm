@@ -1,7 +1,0 @@
-[package]
-name = "heavy-rust-host"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-zkvm-host = { workspace = true }

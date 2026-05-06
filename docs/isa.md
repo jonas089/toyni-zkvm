@@ -202,6 +202,7 @@ purpose:
 
 ```
 let x = 0;          // constant assignment, compiles to IMM
+let x = y;          // copy form, compiles to ADD x, y, r0
 let x = read();     // compiles to READ
 x = y + z;          // ADD; both rhs sides must be variables
 x = y - z;          // SUB
@@ -232,31 +233,24 @@ let b = 1;
 let one = 1;
 while n != 0 {
     let t = a + b;
-    a = b + r0;        // pseudo: needs a "copy" form
-    b = t + r0;
+    let a = b;
+    let b = t;
     n = n - one;
 }
 write(a);
 halt;
 ```
 
-(The `a = b + r0` lines hint that we may want a `let x = y;` copy form
-in `mini` as a 14th rule. Easy to add.)
+## 13. Resolved design choices
 
-## 13. Open questions for review
-
-- Does 8 registers feel right, or would 16 be more comfortable (one
-  more bit in the register-index range check)? Eight is the minimum for
-  fibonacci-style programs.
-- Should `JZ` also have a `JNZ` counterpart, or is one direction enough?
-  (Currently can do `JNZ ra, k` as `JZ ra, +2; JMP k` if needed.)
-- Multiplication: keep it as a primitive (so the AIR has `MUL` as a
-  per-row constraint, which is just `r[rd] = r[ra] * r[rb]`)? Or drop
-  it and force programs to multiply by repeated addition? Keeping it
-  is cheaper; dropping it would shrink the AIR by one constraint and
-  one selector but make programs much less expressive. Recommend keep.
-- For `mini`, should we add `let x = y;` as a copy form, so users don't
-  have to know about `r0`? Recommend yes.
+- **8 registers.** Confirmed; minimum useful size for fibonacci-style
+  programs.
+- **`MUL` as a primitive.** Kept; one per-row constraint
+  `r[rd] = r[ra] * r[rb]`, no comparable cost via repeated addition.
+- **`let x = y;` copy form in `mini`.** Added; compiles to `ADD x, y, r0`.
+- **No `JNZ`.** The DSL's `while x != 0 { ... }` lowers to
+  `JZ x, end; ... ; JMP top; end:`, which is fine. Adding `JNZ` would
+  double the branch surface for negligible benefit.
 
 ## Constraint-system rough sketch (informational, not normative)
 

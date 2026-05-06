@@ -1,0 +1,14 @@
+// Compute fib(n) where n is read from the public input tape.
+// Outputs fib(n) on the public output tape.
+let n = read();
+let a = 0;
+let b = 1;
+let one = 1;
+while n != 0 {
+    let t = a + b;
+    let a = b;
+    let b = t;
+    n = n - one;
+}
+write(a);
+halt;

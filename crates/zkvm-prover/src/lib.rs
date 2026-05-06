@@ -1,10 +1,8 @@
-/// Multi-column STARK prover for the RISC-V ZKVM, built on Toyni primitives.
-///
-/// Two-phase commitment protocol:
-/// 1. Commit main trace columns (execution + sorted tables + program table)
-/// 2. Derive challenges γ, α; compute permutation accumulator columns
-/// 3. Commit accumulator columns
-/// 4. Combined constraint quotient → DEEP → FRI → queries
+//! STARK prover for the small custom VM, built on Toyni primitives.
+//!
+//! Two-phase commit: trace, then accumulator columns. Then a combined
+//! quotient over (transition + accumulator + boundary) constraints, then
+//! DEEP composition + FRI + queries.
 
 use sha2::{Digest, Sha256};
 use toyni::babybear::BabyBear;
@@ -15,16 +13,15 @@ use toyni::merkle::{MerkleProof, MerkleTree};
 use toyni::transcript::FiatShamirTranscript;
 
 use zkvm_air::{
-    eval_transition_constraints, num_transition_constraints,
-    permutation, TraceView,
+    eval_transition_constraints, num_transition_constraints, permutation, TraceView,
 };
-use zkvm_core::trace::{col, NUM_TRACE_COLS, NUM_ACCUM_COLS};
+use zkvm_core::{accum, col, NUM_ACCUM_COLS, NUM_TRACE_COLS};
 
 pub const NUM_QUERIES: usize = 44;
 pub const BLOWUP: usize = 8;
 pub const COSET_SHIFT: u64 = 7;
 
-// ── proof data structures ──────────────────────────────────────────
+// ── proof data structures ─────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct MerkleOpening {
@@ -70,7 +67,6 @@ pub struct ZkvmProof {
     pub accum_at_gz: Vec<BabyBear>,
     pub q_z: BabyBear,
 
-    /// Permutation challenges (4 parallel pairs for ~2^{-60} soundness).
     pub gammas: [BabyBear; 4],
     pub alphas: [BabyBear; 4],
 
@@ -83,15 +79,13 @@ pub struct ZkvmProof {
     pub public_outputs: Vec<u32>,
     pub entry_pc: u32,
 
-    /// Program ROM table: (addr, instr) pairs for verifier binding.
-    pub program_rom: Vec<(u32, u32)>,
-    /// First PC of padding rows (for verifier to reconstruct full program table).
-    pub padding_start_pc: u32,
-    /// Number of real execution steps (before padding).
-    pub num_real_steps: usize,
+    /// Program ROM as a list of (addr, opcode, op_a, op_b, op_c) tuples,
+    /// in canonical order. Used by the verifier to Lagrange-bind the
+    /// program-table columns at the OOD point.
+    pub program_rom: Vec<(u32, u32, u32, u32, u32)>,
 }
 
-// ── prover ──────────────────────────────────────────────────────────
+// ── prover ────────────────────────────────────────────────────────────
 
 pub struct ZkvmProver {
     columns: Vec<Vec<BabyBear>>,
@@ -99,9 +93,7 @@ pub struct ZkvmProver {
     public_inputs: Vec<u32>,
     public_outputs: Vec<u32>,
     entry_pc: u32,
-    program_rom: Vec<(u32, u32)>,
-    padding_start_pc: u32,
-    num_real_steps: usize,
+    program_rom: Vec<(u32, u32, u32, u32, u32)>,
 }
 
 impl ZkvmProver {
@@ -111,20 +103,15 @@ impl ZkvmProver {
         public_inputs: Vec<u32>,
         public_outputs: Vec<u32>,
         entry_pc: u32,
-        program_rom: Vec<(u32, u32)>,
-        padding_start_pc: u32,
-        num_real_steps: usize,
+        program_rom: Vec<(u32, u32, u32, u32, u32)>,
     ) -> Self {
         assert!(!columns.is_empty());
         let n = columns[0].len();
         assert!(n.is_power_of_two() && n >= 2);
         assert_eq!(columns.len(), NUM_TRACE_COLS);
-        for c in &columns {
-            assert_eq!(c.len(), n);
-        }
+        for c in &columns { assert_eq!(c.len(), n); }
         Self {
-            columns, program_hash, public_inputs, public_outputs, entry_pc,
-            program_rom, padding_start_pc, num_real_steps,
+            columns, program_hash, public_inputs, public_outputs, entry_pc, program_rom,
         }
     }
 
@@ -145,39 +132,27 @@ impl ZkvmProver {
         let g = domain.group_gen();
         let shifted_elements = shifted_domain.elements();
 
-        // ── Phase 1: Commit main trace ───────────────────────────────
+        // ── Phase 1: trace ───────────────────────────────────────────
         let t = std::time::Instant::now();
         eprintln!("[prove] [1/8] trace IFFT + LDE FFT ({} cols)...", num_cols);
-        let trace_polys: Vec<Vec<BabyBear>> = self.columns.iter()
-            .map(|col| domain.ifft(col))
-            .collect();
-        let trace_lde: Vec<Vec<BabyBear>> = trace_polys.iter()
-            .map(|coeffs| shifted_domain.fft(coeffs))
-            .collect();
+        let trace_polys: Vec<Vec<BabyBear>> = self.columns.iter().map(|c| domain.ifft(c)).collect();
+        let trace_lde: Vec<Vec<BabyBear>> = trace_polys.iter().map(|c| shifted_domain.fft(c)).collect();
         eprintln!("[prove] [1/8] FFTs done in {:.2?}", t.elapsed());
-        let t_merkle = std::time::Instant::now();
+        let t = std::time::Instant::now();
         let trace_tree = build_row_merkle_tree(&trace_lde, lde_size);
         let trace_commitment = trace_tree.root().unwrap();
-        eprintln!("[prove] [1/8] trace merkle done in {:.2?}", t_merkle.elapsed());
+        eprintln!("[prove] [1/8] trace merkle done in {:.2?}", t.elapsed());
 
         let mut transcript = FiatShamirTranscript::new();
-
-        // Bind public data to transcript before any commitments
         transcript.absorb_commitment(&self.program_hash);
         transcript.absorb_field(BabyBear::from_u32(self.entry_pc));
-        for &inp in &self.public_inputs {
-            transcript.absorb_field(BabyBear::from_u32(inp));
-        }
-        for &out in &self.public_outputs {
-            transcript.absorb_field(BabyBear::from_u32(out));
-        }
-        // Absorb lengths to prevent ambiguity
+        for &v in &self.public_inputs { transcript.absorb_field(BabyBear::from_u32(v)); }
+        for &v in &self.public_outputs { transcript.absorb_field(BabyBear::from_u32(v)); }
         transcript.absorb_field(BabyBear::from_u32(self.public_inputs.len() as u32));
         transcript.absorb_field(BabyBear::from_u32(self.public_outputs.len() as u32));
-
         transcript.absorb_commitment(&trace_commitment);
 
-        // ── Phase 2: Derive permutation challenges (4 pairs), compute accumulators ─
+        // ── Phase 2: accumulators ────────────────────────────────────
         let gammas: [BabyBear; 4] = [
             transcript.squeeze_challenge(), transcript.squeeze_challenge(),
             transcript.squeeze_challenge(), transcript.squeeze_challenge(),
@@ -193,22 +168,15 @@ impl ZkvmProver {
         assert_eq!(accum_columns.len(), NUM_ACCUM_COLS);
         eprintln!("[prove] [2/8] accumulators done in {:.2?}", t.elapsed());
 
-        // Optionally validate constraints before proving (disabled in release)
-        #[cfg(debug_assertions)]
-        {
-            if let Err(e) = zkvm_air::validate_full_trace(&self.columns, &accum_columns, &gammas, &alphas) {
-                panic!("Trace validation failed: {}", e);
-            }
+        // Self-check: every constraint should evaluate to zero on the trace.
+        if let Err(e) = zkvm_air::validate_full_trace(&self.columns, &accum_columns, &gammas, &alphas) {
+            panic!("trace fails validation: {}", e);
         }
 
         let t = std::time::Instant::now();
         eprintln!("[prove] [2/8] accum IFFT + LDE FFT ({} cols)...", NUM_ACCUM_COLS);
-        let accum_polys: Vec<Vec<BabyBear>> = accum_columns.iter()
-            .map(|col| domain.ifft(col))
-            .collect();
-        let accum_lde: Vec<Vec<BabyBear>> = accum_polys.iter()
-            .map(|coeffs| shifted_domain.fft(coeffs))
-            .collect();
+        let accum_polys: Vec<Vec<BabyBear>> = accum_columns.iter().map(|c| domain.ifft(c)).collect();
+        let accum_lde: Vec<Vec<BabyBear>> = accum_polys.iter().map(|c| shifted_domain.fft(c)).collect();
         eprintln!("[prove] [2/8] accum FFTs done in {:.2?}", t.elapsed());
         let t = std::time::Instant::now();
         let accum_tree = build_row_merkle_tree(&accum_lde, lde_size);
@@ -216,27 +184,23 @@ impl ZkvmProver {
         eprintln!("[prove] [2/8] accum merkle done in {:.2?}", t.elapsed());
         transcript.absorb_commitment(&accum_commitment);
 
-        // ── Phase 3: Combined constraint evaluation ──────────────────
-        let num_main_constraints = num_transition_constraints();
-        let num_accum_constraints = permutation::num_accum_constraints();
-        let total_constraints = num_main_constraints + num_accum_constraints;
+        // ── Phase 3: combined constraint quotient ────────────────────
+        let num_main = num_transition_constraints();
+        let num_accum = permutation::num_accum_constraints();
+        let total_constraints = num_main + num_accum;
+        // Boundary: 10 first-row + 1 last-row.
+        let num_b_first = 10;
+        let num_b_last = 1;
+        let total_with_boundary = total_constraints + num_b_first + num_b_last;
 
         let z_poly = Polynomial::new(domain.vanishing_poly_coeffs());
         let omega_n_minus_1 = g.pow((trace_len - 1) as u64);
-
-        // Boundary constraints:
-        // First-row (16): clk=0, pc=entry_pc, 12 GP accums=1, ACCUM_RANGE=1, IS_HALTED=0
-        // Last-row (1): IS_HALTED=1
-        let num_boundary_first = 16;
-        let num_boundary_last = 1;
-        let total_with_boundary = total_constraints + num_boundary_first + num_boundary_last;
+        let entry_pc_f = BabyBear::from_u32(self.entry_pc);
+        let omega_0 = BabyBear::one();
 
         let cweights: Vec<BabyBear> = (0..total_with_boundary)
             .map(|_| transcript.squeeze_challenge())
             .collect();
-
-        let entry_pc_field = BabyBear::from_u32(self.entry_pc);
-        let omega_0 = BabyBear::one(); // ω^0 = 1 (first row)
 
         let t = std::time::Instant::now();
         eprintln!(
@@ -249,8 +213,7 @@ impl ZkvmProver {
             if i > 0 && i % progress_step == 0 {
                 eprintln!(
                     "[prove]   constraint loop {}/{}  ({:.0}%)  elapsed {:.2?}",
-                    i,
-                    lde_size,
+                    i, lde_size,
                     100.0 * i as f64 / lde_size as f64,
                     t.elapsed()
                 );
@@ -262,28 +225,20 @@ impl ZkvmProver {
             let curr_acc: Vec<BabyBear> = accum_lde.iter().map(|c| c[i]).collect();
             let next_acc: Vec<BabyBear> = accum_lde.iter().map(|c| c[next_idx]).collect();
 
-            // Main trace constraints
-            let main_cvals = eval_transition_constraints(&curr, &next);
-            // Accumulator constraints
-            let accum_cvals = permutation::eval_accum_constraints(
+            let main_cv = eval_transition_constraints(&curr, &next);
+            let accum_cv = permutation::eval_accum_constraints(
                 &curr, &next, &curr_acc, &next_acc, &gammas, &alphas,
             );
 
-            // Split into excepted (zeroed at last row) and wrap-around (hold everywhere)
+            // Main constraints: all excepted (zeroed at last row).
             let mut c_excepted = BabyBear::zero();
-            let mut c_wrap = BabyBear::zero();
-            // Main trace constraints: all excepted
-            for (j, &cv) in main_cvals.iter().enumerate() {
-                c_excepted = c_excepted + cweights[j] * cv;
+            for (j, &v) in main_cv.iter().enumerate() {
+                c_excepted = c_excepted + cweights[j] * v;
             }
-            // Accum constraints: split by type
-            let num_main = main_cvals.len();
-            for (j, &cv) in accum_cvals.iter().enumerate() {
-                if permutation::is_wrap_constraint(j) {
-                    c_wrap = c_wrap + cweights[num_main + j] * cv;
-                } else {
-                    c_excepted = c_excepted + cweights[num_main + j] * cv;
-                }
+            // Accum constraints: all wrap-around (hold everywhere).
+            let mut c_wrap = BabyBear::zero();
+            for (j, &v) in accum_cv.iter().enumerate() {
+                c_wrap = c_wrap + cweights[num_main + j] * v;
             }
 
             let x = shifted_elements[i];
@@ -291,39 +246,38 @@ impl ZkvmProver {
             let z_val = z_poly.evaluate(x);
             let transition_q = (c_excepted * exception + c_wrap) / z_val;
 
-            // ── Boundary constraints: first row ──
-            let mut boundary_first = BabyBear::zero();
-            let alpha_base = total_constraints;
-            // clk[first] = 0
-            boundary_first = boundary_first + cweights[alpha_base] * curr.col(col::CLK);
-            // pc[first] = entry_pc
-            boundary_first = boundary_first + cweights[alpha_base + 1] * (curr.col(col::PC) - entry_pc_field);
-            // 12 GP accumulators[first] = 1 (4×mem + 4×reg + 4×fetch)
-            for a in 0..12 {
-                boundary_first = boundary_first
-                    + cweights[alpha_base + 2 + a] * (curr_acc[a] - BabyBear::one());
-            }
-            // ACCUM_RANGE[first] = 1
-            boundary_first = boundary_first
-                + cweights[alpha_base + 14] * (curr_acc[permutation::ACCUM_RANGE] - BabyBear::one());
-            // IS_HALTED[first] = 0
-            boundary_first = boundary_first
-                + cweights[alpha_base + 15] * curr.col(col::IS_HALTED);
-            let boundary_first_q = boundary_first / (x - omega_0);
+            // First-row boundaries.
+            let alpha_b = total_constraints;
+            let mut b_first = BabyBear::zero();
+            // 0: CLK = 0
+            b_first = b_first + cweights[alpha_b]     * curr.col(col::CLK);
+            // 1: PC = entry_pc
+            b_first = b_first + cweights[alpha_b + 1] * (curr.col(col::PC) - entry_pc_f);
+            // 2: HALT = 0
+            b_first = b_first + cweights[alpha_b + 2] * curr.col(col::HALT);
+            // 3: I_IN = 0
+            b_first = b_first + cweights[alpha_b + 3] * curr.col(col::I_IN);
+            // 4: I_OUT = 0
+            b_first = b_first + cweights[alpha_b + 4] * curr.col(col::I_OUT);
+            // 5..: accumulators have specific initial values.
+            let one = BabyBear::one();
+            b_first = b_first + cweights[alpha_b + 5] * (curr_acc[accum::REG]    - one);
+            b_first = b_first + cweights[alpha_b + 6] * (curr_acc[accum::MEM]    - one);
+            b_first = b_first + cweights[alpha_b + 7] * (curr_acc[accum::PROG]);
+            b_first = b_first + cweights[alpha_b + 8] * (curr_acc[accum::PUB_IN]);
+            b_first = b_first + cweights[alpha_b + 9] * (curr_acc[accum::PUB_OUT]);
+            let b_first_q = b_first / (x - omega_0);
 
-            // ── Boundary constraints: last row ──
-            let mut boundary_last = BabyBear::zero();
-            let alpha_last_base = total_constraints + num_boundary_first;
-            // IS_HALTED[last] = 1
-            boundary_last = boundary_last
-                + cweights[alpha_last_base] * (curr.col(col::IS_HALTED) - BabyBear::one());
-            let boundary_last_q = boundary_last / (x - omega_n_minus_1);
+            // Last-row boundary.
+            let alpha_l = total_constraints + num_b_first;
+            let b_last = cweights[alpha_l] * (curr.col(col::HALT) - one);
+            let b_last_q = b_last / (x - omega_n_minus_1);
 
-            q_evals[i] = transition_q + boundary_first_q + boundary_last_q;
+            q_evals[i] = transition_q + b_first_q + b_last_q;
         }
         eprintln!("[prove] [3/8] done in {:.2?}", t.elapsed());
 
-        // ── Phase 4: Commit quotient ─────────────────────────────────
+        // ── Phase 4: commit quotient ─────────────────────────────────
         let t = std::time::Instant::now();
         eprintln!("[prove] [4/8] quotient merkle...");
         let q_tree = build_scalar_merkle_tree(&q_evals);
@@ -331,7 +285,7 @@ impl ZkvmProver {
         eprintln!("[prove] [4/8] done in {:.2?}", t.elapsed());
         transcript.absorb_commitment(&quotient_commitment);
 
-        // ── Phase 5: OOD evaluation ──────────────────────────────────
+        // ── Phase 5: OOD ─────────────────────────────────────────────
         let t = std::time::Instant::now();
         eprintln!("[prove] [5/8] OOD evaluation...");
         let z = derive_z(&mut transcript, &extended_domain, &shifted_domain);
@@ -352,69 +306,53 @@ impl ZkvmProver {
         let q_coeffs = shifted_domain.ifft(&q_evals);
         let q_z = Polynomial::new(q_coeffs).evaluate(z);
 
-        // Sanity check: reconstruct Q(z) and verify it matches
+        // Reconstruct q(z) and verify it matches.
         let curr_z = TraceView { vals: trace_at_z.clone() };
         let next_gz = TraceView { vals: trace_at_gz.clone() };
-        let main_cvals = eval_transition_constraints(&curr_z, &next_gz);
-        let accum_cvals = permutation::eval_accum_constraints(
+        let main_cv = eval_transition_constraints(&curr_z, &next_gz);
+        let accum_cv = permutation::eval_accum_constraints(
             &curr_z, &next_gz, &accum_at_z, &accum_at_gz, &gammas, &alphas,
         );
         let mut c_excepted_z = BabyBear::zero();
-        let mut c_wrap_z = BabyBear::zero();
-        for (j, &cv) in main_cvals.iter().enumerate() {
-            c_excepted_z = c_excepted_z + cweights[j] * cv;
+        for (j, &v) in main_cv.iter().enumerate() {
+            c_excepted_z = c_excepted_z + cweights[j] * v;
         }
-        let num_main = main_cvals.len();
-        for (j, &cv) in accum_cvals.iter().enumerate() {
-            if permutation::is_wrap_constraint(j) {
-                c_wrap_z = c_wrap_z + cweights[num_main + j] * cv;
-            } else {
-                c_excepted_z = c_excepted_z + cweights[num_main + j] * cv;
-            }
+        let mut c_wrap_z = BabyBear::zero();
+        for (j, &v) in accum_cv.iter().enumerate() {
+            c_wrap_z = c_wrap_z + cweights[num_main + j] * v;
         }
         let transition_q_z = (c_excepted_z * (z - omega_n_minus_1) + c_wrap_z) / z_poly.evaluate(z);
 
-        // Boundary at first row
-        let mut boundary_first_z = BabyBear::zero();
-        let alpha_base = total_constraints;
-        boundary_first_z = boundary_first_z + cweights[alpha_base] * trace_at_z[col::CLK];
-        boundary_first_z = boundary_first_z + cweights[alpha_base + 1] * (trace_at_z[col::PC] - entry_pc_field);
-        // 12 GP accumulators[first] = 1 (4×mem + 4×reg + 4×fetch)
-        for a in 0..12 {
-            boundary_first_z = boundary_first_z + cweights[alpha_base + 2 + a] * (accum_at_z[a] - BabyBear::one());
-        }
-        // ACCUM_RANGE[first] = 1
-        boundary_first_z = boundary_first_z
-            + cweights[alpha_base + 14] * (accum_at_z[permutation::ACCUM_RANGE] - BabyBear::one());
-        // IS_HALTED[first] = 0
-        boundary_first_z = boundary_first_z
-            + cweights[alpha_base + 15] * trace_at_z[col::IS_HALTED];
-        let boundary_first_q_z = boundary_first_z / (z - BabyBear::one());
+        let one = BabyBear::one();
+        let alpha_b = total_constraints;
+        let mut b_first_z = BabyBear::zero();
+        b_first_z = b_first_z + cweights[alpha_b]     * trace_at_z[col::CLK];
+        b_first_z = b_first_z + cweights[alpha_b + 1] * (trace_at_z[col::PC] - entry_pc_f);
+        b_first_z = b_first_z + cweights[alpha_b + 2] * trace_at_z[col::HALT];
+        b_first_z = b_first_z + cweights[alpha_b + 3] * trace_at_z[col::I_IN];
+        b_first_z = b_first_z + cweights[alpha_b + 4] * trace_at_z[col::I_OUT];
+        b_first_z = b_first_z + cweights[alpha_b + 5] * (accum_at_z[accum::REG]    - one);
+        b_first_z = b_first_z + cweights[alpha_b + 6] * (accum_at_z[accum::MEM]    - one);
+        b_first_z = b_first_z + cweights[alpha_b + 7] * (accum_at_z[accum::PROG]);
+        b_first_z = b_first_z + cweights[alpha_b + 8] * (accum_at_z[accum::PUB_IN]);
+        b_first_z = b_first_z + cweights[alpha_b + 9] * (accum_at_z[accum::PUB_OUT]);
+        let b_first_qz = b_first_z / (z - one);
 
-        // Boundary at last row
-        let mut boundary_last_z = BabyBear::zero();
-        let alpha_last_base = total_constraints + num_boundary_first;
-        boundary_last_z = boundary_last_z
-            + cweights[alpha_last_base] * (trace_at_z[col::IS_HALTED] - BabyBear::one());
-        let boundary_last_q_z = boundary_last_z / (z - omega_n_minus_1);
+        let alpha_l = total_constraints + num_b_first;
+        let b_last_z = cweights[alpha_l] * (trace_at_z[col::HALT] - one);
+        let b_last_qz = b_last_z / (z - omega_n_minus_1);
 
-        let computed_q_z = transition_q_z + boundary_first_q_z + boundary_last_q_z;
-        assert_eq!(
-            computed_q_z,
-            q_z,
-            "OOD constraint check failed"
-        );
+        let computed_q_z = transition_q_z + b_first_qz + b_last_qz;
+        assert_eq!(computed_q_z, q_z, "OOD constraint check failed");
         eprintln!("[prove] [5/8] done in {:.2?}", t.elapsed());
 
-        // Feed OOD values
         for &v in &trace_at_z { transcript.absorb_field(v); }
         for &v in &trace_at_gz { transcript.absorb_field(v); }
         for &v in &accum_at_z { transcript.absorb_field(v); }
         for &v in &accum_at_gz { transcript.absorb_field(v); }
         transcript.absorb_field(q_z);
 
-        // ── Phase 6: DEEP polynomial with random batching ──────────────
-        // Squeeze random coefficients for each column to prevent cancellation attacks.
+        // ── Phase 6: DEEP ────────────────────────────────────────────
         let num_deep_terms = 2 * num_cols + 2 * NUM_ACCUM_COLS + 1;
         let deep_coeffs: Vec<BabyBear> = (0..num_deep_terms)
             .map(|_| transcript.squeeze_challenge())
@@ -430,8 +368,7 @@ impl ZkvmProver {
             if i > 0 && i % progress_step == 0 {
                 eprintln!(
                     "[prove]   DEEP loop {}/{}  ({:.0}%)  elapsed {:.2?}",
-                    i,
-                    lde_size,
+                    i, lde_size,
                     100.0 * i as f64 / lde_size as f64,
                     t.elapsed()
                 );
@@ -442,28 +379,23 @@ impl ZkvmProver {
 
             let mut d = BabyBear::zero();
             let mut ci = 0;
-            // Main trace at z
             for col_idx in 0..num_cols {
                 d = d + deep_coeffs[ci] * (trace_lde[col_idx][i] - trace_at_z[col_idx]) * inv_x_z;
                 ci += 1;
             }
-            // Main trace at g*z
             let next_i = (i + BLOWUP) % lde_size;
             for col_idx in 0..num_cols {
                 d = d + deep_coeffs[ci] * (trace_lde[col_idx][next_i] - trace_at_gz[col_idx]) * inv_x_gz;
                 ci += 1;
             }
-            // Accum at z
             for col_idx in 0..NUM_ACCUM_COLS {
                 d = d + deep_coeffs[ci] * (accum_lde[col_idx][i] - accum_at_z[col_idx]) * inv_x_z;
                 ci += 1;
             }
-            // Accum at g*z
             for col_idx in 0..NUM_ACCUM_COLS {
                 d = d + deep_coeffs[ci] * (accum_lde[col_idx][next_i] - accum_at_gz[col_idx]) * inv_x_gz;
                 ci += 1;
             }
-            // Quotient at z
             d = d + deep_coeffs[ci] * (q_evals[i] - q_z) * inv_x_z;
             d
         }).collect();
@@ -485,7 +417,6 @@ impl ZkvmProver {
 
         let mut current = d_evals;
         let mut xs: Vec<BabyBear> = shifted_elements.clone();
-
         loop {
             if current.len() <= 1 { break; }
             let beta = transcript.squeeze_challenge();
@@ -509,7 +440,7 @@ impl ZkvmProver {
             fri_layers.len()
         );
 
-        // ── Phase 8: Query phase ─────────────────────────────────────
+        // ── Phase 8: queries ─────────────────────────────────────────
         let t = std::time::Instant::now();
         eprintln!("[prove] [8/8] building {} query proofs...", NUM_QUERIES);
         let first_layer_half = fri_layers[0].len() / 2;
@@ -563,26 +494,24 @@ impl ZkvmProver {
             public_outputs: self.public_outputs.clone(),
             entry_pc: self.entry_pc,
             program_rom: self.program_rom.clone(),
-            padding_start_pc: self.padding_start_pc,
-            num_real_steps: self.num_real_steps,
         }
     }
 }
 
-// ── helper functions ────────────────────────────────────────────────
+// ── helpers ───────────────────────────────────────────────────────────
 
-fn build_trace_view(trace_lde: &[Vec<BabyBear>], row_idx: usize) -> TraceView {
-    TraceView { vals: trace_lde.iter().map(|col| col[row_idx]).collect() }
+fn build_trace_view(trace_lde: &[Vec<BabyBear>], row: usize) -> TraceView {
+    TraceView { vals: trace_lde.iter().map(|c| c[row]).collect() }
 }
 
 fn build_row_merkle_tree(cols: &[Vec<BabyBear>], lde_size: usize) -> MerkleTree {
     let num_cols = cols.len();
     let leaves: Vec<Vec<u8>> = (0..lde_size).map(|i| {
-        let mut hasher = Sha256::new();
+        let mut h = Sha256::new();
         for col in 0..num_cols {
-            hasher.update(cols[col][i].to_bytes());
+            h.update(cols[col][i].to_bytes());
         }
-        hasher.finalize().to_vec()
+        h.finalize().to_vec()
     }).collect();
     MerkleTree::new(leaves)
 }
@@ -607,19 +536,18 @@ fn derive_z(
     extended_domain: &BabyBearDomain,
     shifted_domain: &BabyBearDomain,
 ) -> BabyBear {
-    let ext_set: std::collections::HashSet<BabyBear> = extended_domain.elements().into_iter().collect();
-    let shift_set: std::collections::HashSet<BabyBear> = shifted_domain.elements().into_iter().collect();
+    let ext_set: std::collections::HashSet<BabyBear> =
+        extended_domain.elements().into_iter().collect();
+    let shift_set: std::collections::HashSet<BabyBear> =
+        shifted_domain.elements().into_iter().collect();
     let g = extended_domain.group_gen();
     loop {
         let z = transcript.squeeze_challenge();
-        if !ext_set.contains(&z) && !shift_set.contains(&z) && !shift_set.contains(&(g * z)) {
+        if !ext_set.contains(&z)
+            && !shift_set.contains(&z)
+            && !shift_set.contains(&(g * z))
+        {
             return z;
         }
     }
-}
-
-pub fn hash_program(code: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(code);
-    hasher.finalize().into()
 }

@@ -47,13 +47,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fibonacci-rust-host"
-version = "0.1.0"
-dependencies = [
- "zkvm-host",
-]
-
-[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -227,7 +220,6 @@ dependencies = [
  "toyni",
  "zkvm-air",
  "zkvm-core",
- "zkvm-io",
  "zkvm-prover",
  "zkvm-verifier",
 ]
@@ -238,26 +230,6 @@ version = "0.1.0"
 dependencies = [
  "sha2",
  "toyni",
-]
-
-[[package]]
-name = "zkvm-host"
-version = "0.1.0"
-dependencies = [
- "sha2",
- "toyni",
- "zkvm-air",
- "zkvm-core",
- "zkvm-io",
- "zkvm-prover",
- "zkvm-verifier",
-]
-
-[[package]]
-name = "zkvm-io"
-version = "0.1.0"
-dependencies = [
- "zkvm-core",
 ]
 
 [[package]]

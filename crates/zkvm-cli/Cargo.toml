@@ -13,5 +13,4 @@ zkvm-core = { workspace = true }
 zkvm-air = { workspace = true }
 zkvm-prover = { workspace = true }
 zkvm-verifier = { workspace = true }
-zkvm-io = { workspace = true }
 sha2 = { workspace = true }

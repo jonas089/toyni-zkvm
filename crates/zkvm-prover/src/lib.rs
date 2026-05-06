@@ -129,9 +129,14 @@ impl ZkvmProver {
     }
 
     pub fn prove(&self, use_gpu: bool) -> ZkvmProof {
+        let t_total = std::time::Instant::now();
         let num_cols = self.columns.len();
         let trace_len = self.columns[0].len();
         let lde_size = trace_len * BLOWUP;
+        eprintln!(
+            "[prove] start: trace_len={}, lde_size={}, num_cols={}, gpu={}",
+            trace_len, lde_size, num_cols, use_gpu
+        );
 
         let domain = BabyBearDomain::new(trace_len).with_gpu(use_gpu);
         let extended_domain = BabyBearDomain::new(lde_size).with_gpu(use_gpu);
@@ -141,14 +146,19 @@ impl ZkvmProver {
         let shifted_elements = shifted_domain.elements();
 
         // ── Phase 1: Commit main trace ───────────────────────────────
+        let t = std::time::Instant::now();
+        eprintln!("[prove] [1/8] trace IFFT + LDE FFT ({} cols)...", num_cols);
         let trace_polys: Vec<Vec<BabyBear>> = self.columns.iter()
             .map(|col| domain.ifft(col))
             .collect();
         let trace_lde: Vec<Vec<BabyBear>> = trace_polys.iter()
             .map(|coeffs| shifted_domain.fft(coeffs))
             .collect();
+        eprintln!("[prove] [1/8] FFTs done in {:.2?}", t.elapsed());
+        let t_merkle = std::time::Instant::now();
         let trace_tree = build_row_merkle_tree(&trace_lde, lde_size);
         let trace_commitment = trace_tree.root().unwrap();
+        eprintln!("[prove] [1/8] trace merkle done in {:.2?}", t_merkle.elapsed());
 
         let mut transcript = FiatShamirTranscript::new();
 
@@ -177,8 +187,11 @@ impl ZkvmProver {
             transcript.squeeze_challenge(), transcript.squeeze_challenge(),
         ];
 
+        let t = std::time::Instant::now();
+        eprintln!("[prove] [2/8] compute accumulators...");
         let accum_columns = permutation::compute_accumulators(&self.columns, &gammas, &alphas);
         assert_eq!(accum_columns.len(), NUM_ACCUM_COLS);
+        eprintln!("[prove] [2/8] accumulators done in {:.2?}", t.elapsed());
 
         // Optionally validate constraints before proving (disabled in release)
         #[cfg(debug_assertions)]
@@ -188,14 +201,19 @@ impl ZkvmProver {
             }
         }
 
+        let t = std::time::Instant::now();
+        eprintln!("[prove] [2/8] accum IFFT + LDE FFT ({} cols)...", NUM_ACCUM_COLS);
         let accum_polys: Vec<Vec<BabyBear>> = accum_columns.iter()
             .map(|col| domain.ifft(col))
             .collect();
         let accum_lde: Vec<Vec<BabyBear>> = accum_polys.iter()
             .map(|coeffs| shifted_domain.fft(coeffs))
             .collect();
+        eprintln!("[prove] [2/8] accum FFTs done in {:.2?}", t.elapsed());
+        let t = std::time::Instant::now();
         let accum_tree = build_row_merkle_tree(&accum_lde, lde_size);
         let accum_commitment = accum_tree.root().unwrap();
+        eprintln!("[prove] [2/8] accum merkle done in {:.2?}", t.elapsed());
         transcript.absorb_commitment(&accum_commitment);
 
         // ── Phase 3: Combined constraint evaluation ──────────────────
@@ -220,8 +238,23 @@ impl ZkvmProver {
         let entry_pc_field = BabyBear::from_u32(self.entry_pc);
         let omega_0 = BabyBear::one(); // ω^0 = 1 (first row)
 
+        let t = std::time::Instant::now();
+        eprintln!(
+            "[prove] [3/8] constraint quotient over {} rows (single-threaded CPU)...",
+            lde_size
+        );
+        let progress_step = (lde_size / 16).max(1);
         let mut q_evals = vec![BabyBear::zero(); lde_size];
         for i in 0..lde_size {
+            if i > 0 && i % progress_step == 0 {
+                eprintln!(
+                    "[prove]   constraint loop {}/{}  ({:.0}%)  elapsed {:.2?}",
+                    i,
+                    lde_size,
+                    100.0 * i as f64 / lde_size as f64,
+                    t.elapsed()
+                );
+            }
             let curr = build_trace_view(&trace_lde, i);
             let next_idx = (i + BLOWUP) % lde_size;
             let next = build_trace_view(&trace_lde, next_idx);
@@ -288,13 +321,19 @@ impl ZkvmProver {
 
             q_evals[i] = transition_q + boundary_first_q + boundary_last_q;
         }
+        eprintln!("[prove] [3/8] done in {:.2?}", t.elapsed());
 
         // ── Phase 4: Commit quotient ─────────────────────────────────
+        let t = std::time::Instant::now();
+        eprintln!("[prove] [4/8] quotient merkle...");
         let q_tree = build_scalar_merkle_tree(&q_evals);
         let quotient_commitment = q_tree.root().unwrap();
+        eprintln!("[prove] [4/8] done in {:.2?}", t.elapsed());
         transcript.absorb_commitment(&quotient_commitment);
 
         // ── Phase 5: OOD evaluation ──────────────────────────────────
+        let t = std::time::Instant::now();
+        eprintln!("[prove] [5/8] OOD evaluation...");
         let z = derive_z(&mut transcript, &extended_domain, &shifted_domain);
 
         let trace_at_z: Vec<BabyBear> = trace_polys.iter()
@@ -365,6 +404,7 @@ impl ZkvmProver {
             q_z,
             "OOD constraint check failed"
         );
+        eprintln!("[prove] [5/8] done in {:.2?}", t.elapsed());
 
         // Feed OOD values
         for &v in &trace_at_z { transcript.absorb_field(v); }
@@ -380,7 +420,22 @@ impl ZkvmProver {
             .map(|_| transcript.squeeze_challenge())
             .collect();
 
+        let t = std::time::Instant::now();
+        eprintln!(
+            "[prove] [6/8] DEEP composition over {} rows (single-threaded CPU)...",
+            lde_size
+        );
+        let progress_step = (lde_size / 16).max(1);
         let d_evals: Vec<BabyBear> = (0..lde_size).map(|i| {
+            if i > 0 && i % progress_step == 0 {
+                eprintln!(
+                    "[prove]   DEEP loop {}/{}  ({:.0}%)  elapsed {:.2?}",
+                    i,
+                    lde_size,
+                    100.0 * i as f64 / lde_size as f64,
+                    t.elapsed()
+                );
+            }
             let x = shifted_elements[i];
             let inv_x_z = (x - z).inverse();
             let inv_x_gz = (x - g * z).inverse();
@@ -412,8 +467,11 @@ impl ZkvmProver {
             d = d + deep_coeffs[ci] * (q_evals[i] - q_z) * inv_x_z;
             d
         }).collect();
+        eprintln!("[prove] [6/8] done in {:.2?}", t.elapsed());
 
         // ── Phase 7: FRI ─────────────────────────────────────────────
+        let t = std::time::Instant::now();
+        eprintln!("[prove] [7/8] FRI commit + folding...");
         let mut fri_layers: Vec<Vec<BabyBear>> = Vec::new();
         let mut fri_trees: Vec<MerkleTree> = Vec::new();
         let mut fri_commitments: Vec<Vec<u8>> = Vec::new();
@@ -445,8 +503,15 @@ impl ZkvmProver {
             if is_constant { break; }
         }
         let fri_final_value = current[0];
+        eprintln!(
+            "[prove] [7/8] done in {:.2?} ({} layers)",
+            t.elapsed(),
+            fri_layers.len()
+        );
 
         // ── Phase 8: Query phase ─────────────────────────────────────
+        let t = std::time::Instant::now();
+        eprintln!("[prove] [8/8] building {} query proofs...", NUM_QUERIES);
         let first_layer_half = fri_layers[0].len() / 2;
         let query_indices = transcript.squeeze_indices(NUM_QUERIES, first_layer_half);
 
@@ -483,6 +548,8 @@ impl ZkvmProver {
                 fri_openings,
             });
         }
+        eprintln!("[prove] [8/8] done in {:.2?}", t.elapsed());
+        eprintln!("[prove] TOTAL: {:.2?}", t_total.elapsed());
 
         ZkvmProof {
             trace_len, lde_size, num_cols,

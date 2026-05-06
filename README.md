@@ -148,28 +148,58 @@ cargo run --release -p zkvm-cli --features cuda -- \
 ZKVM_DUMP_ASM=1 cargo run --release -p zkvm-cli -- prove examples/fibonacci.mini -i 5
 ```
 
-## Known soundness gaps (v1)
+## Soundness
 
-The AIR is small enough to walk through, but several simplifications mean
-that a determined attacker can construct fake proofs without much effort.
-These are deliberate scope limits for v1, not unknown bugs:
+The AIR enforces:
 
-1. **Sorted-table ordering is not range-checked.** The register-file and
-   memory consistency arguments rely on the prover providing an ordered
-   sorted table, but nothing in the AIR forces the ordering to be
-   monotone. A malicious prover can re-order entries within the same
-   register/address to put a "read" before its "write".
-2. **No initial-state binding.** The first sorted access for any
-   register or memory address can claim arbitrary values. There is no
-   constraint that uninitialised memory reads as 0 or that registers
-   start at 0.
-3. **Single-channel permutation arguments.** Each grand-product /
-   LogUp argument uses one (γ, α) pair, giving roughly 2⁻³⁰ soundness
-   instead of the 2⁻⁶⁰ that 4 channels would give.
+- **Per-instruction semantics.** Every opcode's selector forces the
+  corresponding effect on its slots: ALU/IMM constrain register writes,
+  LOAD/STORE pin memory addr+val to register slots, JMP/JZ/HALT control
+  PC, READ/WRITE bind public-IO cursors. Selector booleanity + sum-to-1
+  + OPCODE-column reconstruction prevent the prover from running two
+  opcodes' constraints on the same row or none at all.
+- **Register-file consistency.** Three register-access slots per row
+  enter a 4-channel grand-product permutation against a sorted table.
+  Within the sorted table, read-after-write constraints force any read
+  of a register to return the most recent write's value, and a fresh
+  register (first time it appears in the sort) read returns 0. Cross-slot
+  transitions (B vs A, C vs B, A[i+1] vs C[i]) are all constrained.
+- **Memory consistency.** Same shape as the register file with one slot
+  per row, gated by a `MEM_USED` flag tied to LOAD/STORE selectors.
+- **Sorted-table ordering range check.** Every sorted-table transition
+  (4 in total) bit-decomposes its sort-key diff into 16 boolean bits.
+  Reversed orderings produce diffs of size ~2³¹ (much greater than 2¹⁶)
+  and the bit-reconstruction constraint catches them.
+- **Program ROM binding.** The (PC, opcode, op_a, op_b, op_c) executed
+  on each row is matched (4-channel LogUp) against a Lagrange-bound
+  ROM table whose hash is committed in the proof's public values.
+- **Public input/output binding.** READ rows feed `(i_in, val)` into a
+  4-channel LogUp against a Lagrange-bound public-input table; WRITE
+  rows do the symmetric thing on the output side.
+- **Boundary.** First-row state is forced (CLK=0, PC=entry_pc, HALT=0,
+  cursors=0, all 20 accumulator initial values pinned). Last-row HALT=1.
+  HALT monotonicity prevents un-halting.
+- **r0 hardwiring.** Per-row inverse-trick on each register-access slot
+  forces `idx=0 ⇒ val=0`.
+- **4-channel permutation arguments.** Each of the 5 multiset arguments
+  runs in 4 parallel γ/α channels for ~2⁻⁶⁰ soundness.
 
-For a learning project this is the deliberate "not strongly sound, but
-not trivially broken" trade-off. Closing any of these is a self-contained
-piece of work.
+### Known limitations
+
+- **Memory addresses are implicitly assumed to fit in 16 bits.** The
+  sorted-memory ordering range check uses 16-bit decomposition of the
+  address diff, so addresses outside `[0, 2¹⁶)` would overflow. The
+  fibonacci example doesn't touch memory; programs that do should keep
+  addresses small. Fixing this means range-checking the address itself
+  too, which adds another decomposition.
+- **Bit-decomposition isn't multiplicity-checked.** A malicious prover
+  can set bit columns to non-boolean values, but the booleanity
+  constraints `bit * (bit - 1) = 0` are enforced inside the AIR — so
+  this is closed.
+
+This is meant to be reviewable by hand. The whole AIR is one file
+(`crates/zkvm-air/src/lib.rs`, ~430 lines). If you find a gap,
+please open an issue or PR.
 
 ## Development
 

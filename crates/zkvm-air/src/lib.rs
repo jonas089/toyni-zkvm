@@ -20,7 +20,7 @@
 
 use toyni::babybear::BabyBear;
 
-use zkvm_core::{accum, col, NUM_ACCUM_COLS, NUM_OPCODES, NUM_TRACE_COLS};
+use zkvm_core::{accum, col, NUM_ACCUM_COLS, NUM_CHANNELS, NUM_OPCODES, NUM_TRACE_COLS};
 
 #[derive(Clone)]
 pub struct TraceView {
@@ -136,6 +136,109 @@ pub fn eval_transition_constraints(curr: &TraceView, next: &TraceView) -> Vec<Ba
     c.extend(jump_constraints(curr));
     c.extend(memory_op_constraints(curr));
     c.extend(io_constraints(curr));
+
+    // 13. Sorted-table read-after-write + init binding + ordering range check.
+    //
+    // Three register-slot transitions and one memory transition. All are
+    // "main transition" constraints (excepted at the last row), because at
+    // the cyclic wrap-around the diff direction reverses.
+    c.extend(reg_slot_transition(curr, curr,
+        col::SREG_A, col::SREG_B, col::SREG_A + 4, col::DIFF_BITS_AB));
+    c.extend(reg_slot_transition(curr, curr,
+        col::SREG_B, col::SREG_C, col::SREG_B + 4, col::DIFF_BITS_BC));
+    c.extend(reg_slot_transition(curr, next,
+        col::SREG_C, col::SREG_A, col::SREG_C + 4, col::DIFF_BITS_CA));
+    c.extend(mem_slot_transition(curr, next));
+
+    c
+}
+
+/// Constraint pack for a sorted register-slot transition (prev → next).
+/// `prev_view` and `next_view` differ only for the cross-row C → A[i+1] case.
+fn reg_slot_transition(
+    prev_view: &TraceView,
+    next_view: &TraceView,
+    prev_base: usize,
+    next_base: usize,
+    aux_base: usize,
+    bits_base: usize,
+) -> Vec<BabyBear> {
+    let mut c = Vec::new();
+    let one = BabyBear::one();
+
+    let prev_idx = prev_view.col(prev_base);
+    let prev_val = prev_view.col(prev_base + 1);
+    let prev_clk = prev_view.col(prev_base + 2);
+    let next_idx = next_view.col(next_base);
+    let next_val = next_view.col(next_base + 1);
+    let next_clk = next_view.col(next_base + 2);
+    let next_wr  = next_view.col(next_base + 3);
+
+    let same_idx = prev_view.col(aux_base);
+    let diff_inv = prev_view.col(aux_base + 1);
+
+    // same_idx is boolean.
+    c.push(same_idx * (same_idx - one));
+    // When same_idx = 1, idx must match.
+    c.push(same_idx * (next_idx - prev_idx));
+    // When same_idx = 0, the difference is invertible (so non-zero).
+    c.push((one - same_idx) * (one - (next_idx - prev_idx) * diff_inv));
+
+    // Read-after-write: same_idx and the next access is a read => values match.
+    c.push(same_idx * (one - next_wr) * (next_val - prev_val));
+
+    // Init binding: a fresh idx (same_idx = 0) that is read => val = 0.
+    c.push((one - same_idx) * (one - next_wr) * next_val);
+
+    // Range check: diff = same_idx*(next_clk - prev_clk) + (1-same_idx)*(next_idx - prev_idx)
+    // is encoded as (diff - 1) = sum_{k=0}^{15} bit_k * 2^k, with each bit boolean.
+    let diff = same_idx * (next_clk - prev_clk) + (one - same_idx) * (next_idx - prev_idx);
+    let mut recon = BabyBear::zero();
+    for k in 0..16 {
+        let bit = prev_view.col(bits_base + k);
+        c.push(bit * (bit - one));
+        recon = recon + bit * BabyBear::from_u32(1u32 << k);
+    }
+    c.push(diff - recon);
+
+    c
+}
+
+/// Constraint pack for the sorted memory transition.
+fn mem_slot_transition(curr: &TraceView, next: &TraceView) -> Vec<BabyBear> {
+    let mut c = Vec::new();
+    let one = BabyBear::one();
+
+    let prev_addr = curr.col(col::SMEM);
+    let prev_val  = curr.col(col::SMEM + 1);
+    let prev_clk  = curr.col(col::SMEM + 2);
+    let next_addr = next.col(col::SMEM);
+    let next_val  = next.col(col::SMEM + 1);
+    let next_clk  = next.col(col::SMEM + 2);
+    let next_wr   = next.col(col::SMEM + 3);
+    let next_used = next.col(col::SMEM + 4);
+
+    let same_addr = curr.col(col::SMEM + 5);
+    let diff_inv  = curr.col(col::SMEM + 6);
+
+    c.push(same_addr * (same_addr - one));
+    c.push(same_addr * (next_addr - prev_addr));
+    c.push((one - same_addr) * (one - (next_addr - prev_addr) * diff_inv));
+
+    // R-A-W (only fires when the next access is actually used and is a read).
+    c.push(next_used * same_addr * (one - next_wr) * (next_val - prev_val));
+    // Init binding (only when next is used, fresh address, and a read).
+    c.push(next_used * (one - same_addr) * (one - next_wr) * next_val);
+
+    // Range check on the diff.
+    let diff = same_addr * (next_clk - prev_clk) + (one - same_addr) * (next_addr - prev_addr);
+    let mut recon = BabyBear::zero();
+    for k in 0..16 {
+        let bit = curr.col(col::DIFF_BITS_M + k);
+        c.push(bit * (bit - one));
+        recon = recon + bit * BabyBear::from_u32(1u32 << k);
+    }
+    c.push(diff - recon);
 
     c
 }
@@ -298,140 +401,115 @@ fn io_constraints(curr: &TraceView) -> Vec<BabyBear> {
 pub mod permutation {
     use super::*;
 
-    /// Single (γ, α) channel; gammas[0] / alphas[0] are used.
+    /// Compute all 4-channel accumulator columns. Layout:
+    ///   accum[arg::REG  + ch] for ch in 0..4 (grand product)
+    ///   accum[arg::MEM  + ch] for ch in 0..4 (grand product)
+    ///   accum[arg::PROG + ch] for ch in 0..4 (LogUp)
+    ///   accum[arg::PUB_IN  + ch] (LogUp)
+    ///   accum[arg::PUB_OUT + ch] (LogUp)
     pub fn compute_accumulators(
         columns: &[Vec<BabyBear>],
         gammas: &[BabyBear; 4],
         alphas: &[BabyBear; 4],
     ) -> Vec<Vec<BabyBear>> {
         let n = columns[0].len();
-        let g = gammas[0];
-        let a = alphas[0];
 
-        let compress = |vals: &[BabyBear]| -> BabyBear {
-            let mut acc = BabyBear::zero();
-            let mut ap = BabyBear::one();
-            for &v in vals { acc = acc + v * ap; ap = ap * a; }
-            acc
-        };
-
-        // Grand-product accumulators start at 1, LogUp accumulators at 0.
         let mut accums: Vec<Vec<BabyBear>> = (0..NUM_ACCUM_COLS)
             .map(|j| {
-                let init = if j == accum::REG || j == accum::MEM {
-                    BabyBear::one()
-                } else {
-                    BabyBear::zero()
-                };
+                let init = if j < accum::PROG { BabyBear::one() } else { BabyBear::zero() };
                 let mut col = vec![BabyBear::zero(); n];
                 col[0] = init;
                 col
             })
             .collect();
 
-        for i in 0..n - 1 {
-            // ── register file (grand product, multi-slot) ──
-            let mut num = BabyBear::one();
-            for &(b_idx, b_val, b_wr) in &[
-                (col::REG_A_IDX, col::REG_A_VAL, col::REG_A_WR),
-                (col::REG_B_IDX, col::REG_B_VAL, col::REG_B_WR),
-                (col::REG_C_IDX, col::REG_C_VAL, col::REG_C_WR),
-            ] {
-                let t = compress(&[
-                    columns[b_idx][i], columns[b_val][i],
-                    columns[col::CLK][i], columns[b_wr][i],
+        for ch in 0..NUM_CHANNELS {
+            let g = gammas[ch];
+            let a = alphas[ch];
+            let compress = |vals: &[BabyBear]| -> BabyBear {
+                let mut acc = BabyBear::zero();
+                let mut ap = BabyBear::one();
+                for &v in vals { acc = acc + v * ap; ap = ap * a; }
+                acc
+            };
+
+            for i in 0..n - 1 {
+                // ── register file (grand product, 3 slots / row) ──
+                let mut num = BabyBear::one();
+                for &(b_idx, b_val, b_wr) in &[
+                    (col::REG_A_IDX, col::REG_A_VAL, col::REG_A_WR),
+                    (col::REG_B_IDX, col::REG_B_VAL, col::REG_B_WR),
+                    (col::REG_C_IDX, col::REG_C_VAL, col::REG_C_WR),
+                ] {
+                    let t = compress(&[
+                        columns[b_idx][i], columns[b_val][i],
+                        columns[col::CLK][i], columns[b_wr][i],
+                    ]);
+                    num = num * (t + g);
+                }
+                let mut den = BabyBear::one();
+                for &base in &[col::SREG_A, col::SREG_B, col::SREG_C] {
+                    let t = compress(&[
+                        columns[base    ][i], columns[base + 1][i],
+                        columns[base + 2][i], columns[base + 3][i],
+                    ]);
+                    den = den * (t + g);
+                }
+                accums[accum::REG + ch][i + 1] = accums[accum::REG + ch][i] * num * den.inverse();
+
+                // ── memory (grand product, single slot) ──
+                let m_main = compress(&[
+                    columns[col::MEM_ADDR][i], columns[col::MEM_VAL][i],
+                    columns[col::CLK][i],      columns[col::MEM_WR][i],
+                    columns[col::MEM_USED][i],
                 ]);
-                num = num * (t + g);
-            }
-            let mut den = BabyBear::one();
-            for &base in &[col::SREG_A, col::SREG_B, col::SREG_C] {
-                let t = compress(&[
-                    columns[base    ][i], columns[base + 1][i],
-                    columns[base + 2][i], columns[base + 3][i],
+                let m_sorted = compress(&[
+                    columns[col::SMEM    ][i], columns[col::SMEM + 1][i],
+                    columns[col::SMEM + 2][i], columns[col::SMEM + 3][i],
+                    columns[col::SMEM + 4][i],
                 ]);
-                den = den * (t + g);
+                accums[accum::MEM + ch][i + 1] = accums[accum::MEM + ch][i]
+                    * (m_main + g) * (m_sorted + g).inverse();
+
+                // ── program ROM (LogUp) ──
+                let exec = compress(&[
+                    columns[col::PC][i],     columns[col::OPCODE][i],
+                    columns[col::OP_A][i],   columns[col::OP_B][i],
+                    columns[col::OP_C][i],
+                ]);
+                let rom = compress(&[
+                    columns[col::PROG    ][i], columns[col::PROG + 1][i],
+                    columns[col::PROG + 2][i], columns[col::PROG + 3][i],
+                    columns[col::PROG + 4][i],
+                ]);
+                let mult = columns[col::PROG + 5][i];
+                let exec_term = (exec + g).inverse();
+                let rom_term = if mult.is_zero() { BabyBear::zero() } else { mult * (rom + g).inverse() };
+                accums[accum::PROG + ch][i + 1] = accums[accum::PROG + ch][i] + exec_term - rom_term;
+
+                // ── public input (LogUp) ──
+                let sel_read = columns[col::SEL_START + opc::READ][i];
+                let exec_in = compress(&[columns[col::I_IN][i], columns[col::REG_C_VAL][i]]);
+                let tab_in = compress(&[columns[col::PUB_IN][i], columns[col::PUB_IN + 1][i]]);
+                let tab_in_m = columns[col::PUB_IN + 2][i];
+                let et = if sel_read.is_zero() { BabyBear::zero() } else { sel_read * (exec_in + g).inverse() };
+                let tt = if tab_in_m.is_zero() { BabyBear::zero() } else { tab_in_m * (tab_in + g).inverse() };
+                accums[accum::PUB_IN + ch][i + 1] = accums[accum::PUB_IN + ch][i] + et - tt;
+
+                // ── public output (LogUp) ──
+                let sel_write = columns[col::SEL_START + opc::WRITE][i];
+                let exec_out = compress(&[columns[col::I_OUT][i], columns[col::REG_A_VAL][i]]);
+                let tab_out = compress(&[columns[col::PUB_OUT][i], columns[col::PUB_OUT + 1][i]]);
+                let tab_out_m = columns[col::PUB_OUT + 2][i];
+                let et = if sel_write.is_zero() { BabyBear::zero() } else { sel_write * (exec_out + g).inverse() };
+                let tt = if tab_out_m.is_zero() { BabyBear::zero() } else { tab_out_m * (tab_out + g).inverse() };
+                accums[accum::PUB_OUT + ch][i + 1] = accums[accum::PUB_OUT + ch][i] + et - tt;
             }
-            accums[accum::REG][i + 1] = accums[accum::REG][i] * num * den.inverse();
-
-            // ── memory (grand product, single slot) ──
-            let m_main = compress(&[
-                columns[col::MEM_ADDR][i], columns[col::MEM_VAL][i],
-                columns[col::CLK][i],      columns[col::MEM_WR][i],
-                columns[col::MEM_USED][i],
-            ]);
-            let m_sorted = compress(&[
-                columns[col::SMEM    ][i], columns[col::SMEM + 1][i],
-                columns[col::SMEM + 2][i], columns[col::SMEM + 3][i],
-                columns[col::SMEM + 4][i],
-            ]);
-            accums[accum::MEM][i + 1] = accums[accum::MEM][i]
-                * (m_main + g) * (m_sorted + g).inverse();
-
-            // ── program ROM (LogUp) ──
-            // Z[i+1] = Z[i] + 1/(exec + g) - mult/(rom + g)
-            let exec = compress(&[
-                columns[col::PC][i],     columns[col::OPCODE][i],
-                columns[col::OP_A][i],   columns[col::OP_B][i],
-                columns[col::OP_C][i],
-            ]);
-            let rom = compress(&[
-                columns[col::PROG    ][i], columns[col::PROG + 1][i],
-                columns[col::PROG + 2][i], columns[col::PROG + 3][i],
-                columns[col::PROG + 4][i],
-            ]);
-            let mult = columns[col::PROG + 5][i];
-            let exec_inv = (exec + g).inverse();
-            let rom_term = if mult.is_zero() {
-                BabyBear::zero()
-            } else {
-                mult * (rom + g).inverse()
-            };
-            accums[accum::PROG][i + 1] = accums[accum::PROG][i] + exec_inv - rom_term;
-
-            // ── public input (LogUp) ──
-            // Exec side: when sel_read=1, contribute 1/((i_in_pre, val) + γ_compressed).
-            // Table side: subtract 1/((j, public_inputs[j]) + γ) at row j.
-            // Multiplicities are 0/1 per row.
-            let sel_read = columns[col::SEL_START + opc::READ][i];
-            let exec_in = compress(&[columns[col::I_IN][i], columns[col::REG_C_VAL][i]]);
-            let table_in = compress(&[columns[col::PUB_IN][i], columns[col::PUB_IN + 1][i]]);
-            let table_mult = columns[col::PUB_IN + 2][i];
-            let exec_term = if sel_read.is_zero() {
-                BabyBear::zero()
-            } else {
-                sel_read * (exec_in + g).inverse()
-            };
-            let tab_term = if table_mult.is_zero() {
-                BabyBear::zero()
-            } else {
-                table_mult * (table_in + g).inverse()
-            };
-            accums[accum::PUB_IN][i + 1] = accums[accum::PUB_IN][i] + exec_term - tab_term;
-
-            // ── public output (LogUp) ──
-            let sel_write = columns[col::SEL_START + opc::WRITE][i];
-            let exec_out = compress(&[columns[col::I_OUT][i], columns[col::REG_A_VAL][i]]);
-            let table_out = compress(&[columns[col::PUB_OUT][i], columns[col::PUB_OUT + 1][i]]);
-            let table_out_mult = columns[col::PUB_OUT + 2][i];
-            let exec_term_out = if sel_write.is_zero() {
-                BabyBear::zero()
-            } else {
-                sel_write * (exec_out + g).inverse()
-            };
-            let tab_term_out = if table_out_mult.is_zero() {
-                BabyBear::zero()
-            } else {
-                table_out_mult * (table_out + g).inverse()
-            };
-            accums[accum::PUB_OUT][i + 1] = accums[accum::PUB_OUT][i] + exec_term_out - tab_term_out;
         }
 
         accums
     }
 
-    /// All accumulator constraints are wrap-around (the last-row → first-row
-    /// transition closes the multiset). The verifier checks Z[0] separately
-    /// via boundary constraints.
     pub fn eval_accum_constraints(
         curr: &TraceView,
         _next: &TraceView,
@@ -440,98 +518,91 @@ pub mod permutation {
         gammas: &[BabyBear; 4],
         alphas: &[BabyBear; 4],
     ) -> Vec<BabyBear> {
-        let g = gammas[0];
-        let a = alphas[0];
         let mut c = Vec::new();
         let one = BabyBear::one();
 
-        let compress = |vals: &[BabyBear]| -> BabyBear {
-            let mut acc = BabyBear::zero();
-            let mut ap = BabyBear::one();
-            for &v in vals { acc = acc + v * ap; ap = ap * a; }
-            acc
-        };
+        for ch in 0..NUM_CHANNELS {
+            let g = gammas[ch];
+            let a = alphas[ch];
+            let compress = |vals: &[BabyBear]| -> BabyBear {
+                let mut acc = BabyBear::zero();
+                let mut ap = BabyBear::one();
+                for &v in vals { acc = acc + v * ap; ap = ap * a; }
+                acc
+            };
 
-        // ── reg-file (grand product) ──
-        // next.Z * den = curr.Z * num
-        let mut num = one;
-        for &(b_idx, b_val, b_wr) in &[
-            (col::REG_A_IDX, col::REG_A_VAL, col::REG_A_WR),
-            (col::REG_B_IDX, col::REG_B_VAL, col::REG_B_WR),
-            (col::REG_C_IDX, col::REG_C_VAL, col::REG_C_WR),
-        ] {
-            let t = compress(&[curr.col(b_idx), curr.col(b_val), curr.col(col::CLK), curr.col(b_wr)]);
-            num = num * (t + g);
+            // ── reg-file (GP) ──
+            let mut num = one;
+            for &(b_idx, b_val, b_wr) in &[
+                (col::REG_A_IDX, col::REG_A_VAL, col::REG_A_WR),
+                (col::REG_B_IDX, col::REG_B_VAL, col::REG_B_WR),
+                (col::REG_C_IDX, col::REG_C_VAL, col::REG_C_WR),
+            ] {
+                let t = compress(&[curr.col(b_idx), curr.col(b_val), curr.col(col::CLK), curr.col(b_wr)]);
+                num = num * (t + g);
+            }
+            let mut den = one;
+            for &base in &[col::SREG_A, col::SREG_B, col::SREG_C] {
+                let t = compress(&[curr.col(base), curr.col(base + 1), curr.col(base + 2), curr.col(base + 3)]);
+                den = den * (t + g);
+            }
+            c.push(next_acc[accum::REG + ch] * den - curr_acc[accum::REG + ch] * num);
+
+            // ── memory (GP) ──
+            let m_main = compress(&[
+                curr.col(col::MEM_ADDR), curr.col(col::MEM_VAL),
+                curr.col(col::CLK),      curr.col(col::MEM_WR),
+                curr.col(col::MEM_USED),
+            ]);
+            let m_sorted = compress(&[
+                curr.col(col::SMEM    ), curr.col(col::SMEM + 1),
+                curr.col(col::SMEM + 2), curr.col(col::SMEM + 3),
+                curr.col(col::SMEM + 4),
+            ]);
+            c.push(next_acc[accum::MEM + ch] * (m_sorted + g) - curr_acc[accum::MEM + ch] * (m_main + g));
+
+            // ── program ROM (LogUp) ──
+            let exec = compress(&[
+                curr.col(col::PC),     curr.col(col::OPCODE),
+                curr.col(col::OP_A),   curr.col(col::OP_B),
+                curr.col(col::OP_C),
+            ]);
+            let rom = compress(&[
+                curr.col(col::PROG    ), curr.col(col::PROG + 1),
+                curr.col(col::PROG + 2), curr.col(col::PROG + 3),
+                curr.col(col::PROG + 4),
+            ]);
+            let mult = curr.col(col::PROG + 5);
+            c.push(
+                (next_acc[accum::PROG + ch] - curr_acc[accum::PROG + ch]) * (exec + g) * (rom + g)
+                - (rom + g) + mult * (exec + g)
+            );
+
+            // ── public input (LogUp) ──
+            let sel_read = curr.sel(opc::READ);
+            let exec_in = compress(&[curr.col(col::I_IN), curr.col(col::REG_C_VAL)]);
+            let tab_in = compress(&[curr.col(col::PUB_IN), curr.col(col::PUB_IN + 1)]);
+            let tab_in_m = curr.col(col::PUB_IN + 2);
+            c.push(
+                (next_acc[accum::PUB_IN + ch] - curr_acc[accum::PUB_IN + ch]) * (exec_in + g) * (tab_in + g)
+                - sel_read * (tab_in + g) + tab_in_m * (exec_in + g)
+            );
+
+            // ── public output (LogUp) ──
+            let sel_write = curr.sel(opc::WRITE);
+            let exec_out = compress(&[curr.col(col::I_OUT), curr.col(col::REG_A_VAL)]);
+            let tab_out = compress(&[curr.col(col::PUB_OUT), curr.col(col::PUB_OUT + 1)]);
+            let tab_out_m = curr.col(col::PUB_OUT + 2);
+            c.push(
+                (next_acc[accum::PUB_OUT + ch] - curr_acc[accum::PUB_OUT + ch]) * (exec_out + g) * (tab_out + g)
+                - sel_write * (tab_out + g) + tab_out_m * (exec_out + g)
+            );
         }
-        let mut den = one;
-        for &base in &[col::SREG_A, col::SREG_B, col::SREG_C] {
-            let t = compress(&[curr.col(base), curr.col(base + 1), curr.col(base + 2), curr.col(base + 3)]);
-            den = den * (t + g);
-        }
-        c.push(next_acc[accum::REG] * den - curr_acc[accum::REG] * num);
-
-        // ── memory (grand product) ──
-        let m_main = compress(&[
-            curr.col(col::MEM_ADDR), curr.col(col::MEM_VAL),
-            curr.col(col::CLK),      curr.col(col::MEM_WR),
-            curr.col(col::MEM_USED),
-        ]);
-        let m_sorted = compress(&[
-            curr.col(col::SMEM    ), curr.col(col::SMEM + 1),
-            curr.col(col::SMEM + 2), curr.col(col::SMEM + 3),
-            curr.col(col::SMEM + 4),
-        ]);
-        c.push(
-            next_acc[accum::MEM] * (m_sorted + g)
-            - curr_acc[accum::MEM] * (m_main + g)
-        );
-
-        // ── program ROM (LogUp) ──
-        // (next.Z - curr.Z) * (exec+g)*(rom+g) = (rom+g) - mult*(exec+g)
-        let exec = compress(&[
-            curr.col(col::PC),     curr.col(col::OPCODE),
-            curr.col(col::OP_A),   curr.col(col::OP_B),
-            curr.col(col::OP_C),
-        ]);
-        let rom = compress(&[
-            curr.col(col::PROG    ), curr.col(col::PROG + 1),
-            curr.col(col::PROG + 2), curr.col(col::PROG + 3),
-            curr.col(col::PROG + 4),
-        ]);
-        let mult = curr.col(col::PROG + 5);
-        c.push(
-            (next_acc[accum::PROG] - curr_acc[accum::PROG]) * (exec + g) * (rom + g)
-            - (rom + g) + mult * (exec + g)
-        );
-
-        // ── public input (LogUp) ──
-        // (next.Z - curr.Z) * (exec+g)*(table+g)
-        //   = sel_read*(table+g) - table_mult*(exec+g)
-        let sel_read = curr.sel(opc::READ);
-        let exec_in = compress(&[curr.col(col::I_IN), curr.col(col::REG_C_VAL)]);
-        let table_in = compress(&[curr.col(col::PUB_IN), curr.col(col::PUB_IN + 1)]);
-        let table_in_mult = curr.col(col::PUB_IN + 2);
-        c.push(
-            (next_acc[accum::PUB_IN] - curr_acc[accum::PUB_IN]) * (exec_in + g) * (table_in + g)
-            - sel_read * (table_in + g) + table_in_mult * (exec_in + g)
-        );
-
-        // ── public output (LogUp) ──
-        let sel_write = curr.sel(opc::WRITE);
-        let exec_out = compress(&[curr.col(col::I_OUT), curr.col(col::REG_A_VAL)]);
-        let table_out = compress(&[curr.col(col::PUB_OUT), curr.col(col::PUB_OUT + 1)]);
-        let table_out_mult = curr.col(col::PUB_OUT + 2);
-        c.push(
-            (next_acc[accum::PUB_OUT] - curr_acc[accum::PUB_OUT]) * (exec_out + g) * (table_out + g)
-            - sel_write * (table_out + g) + table_out_mult * (exec_out + g)
-        );
 
         c
     }
 
-    pub fn num_accum_constraints() -> usize { 5 }
-
-    /// All 5 accumulator transitions are cyclic (must hold including wrap).
+    pub fn num_accum_constraints() -> usize { 5 * NUM_CHANNELS }
     pub fn is_wrap_constraint(_j: usize) -> bool { true }
 }
 

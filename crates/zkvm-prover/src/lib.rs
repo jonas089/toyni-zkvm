@@ -15,7 +15,7 @@ use toyni::transcript::FiatShamirTranscript;
 use zkvm_air::{
     eval_transition_constraints, num_transition_constraints, permutation, TraceView,
 };
-use zkvm_core::{accum, col, NUM_ACCUM_COLS, NUM_TRACE_COLS};
+use zkvm_core::{accum, col, NUM_ACCUM_COLS, NUM_CHANNELS, NUM_TRACE_COLS};
 
 pub const NUM_QUERIES: usize = 44;
 pub const BLOWUP: usize = 8;
@@ -188,8 +188,9 @@ impl ZkvmProver {
         let num_main = num_transition_constraints();
         let num_accum = permutation::num_accum_constraints();
         let total_constraints = num_main + num_accum;
-        // Boundary: 10 first-row + 1 last-row.
-        let num_b_first = 10;
+        // Boundary: 5 state cells + 5 args × NUM_CHANNELS accumulator inits = 25 first-row;
+        //           HALT=1 = 1 last-row.
+        let num_b_first = 5 + 5 * NUM_CHANNELS;
         let num_b_last = 1;
         let total_with_boundary = total_constraints + num_b_first + num_b_last;
 
@@ -248,24 +249,21 @@ impl ZkvmProver {
 
             // First-row boundaries.
             let alpha_b = total_constraints;
-            let mut b_first = BabyBear::zero();
-            // 0: CLK = 0
-            b_first = b_first + cweights[alpha_b]     * curr.col(col::CLK);
-            // 1: PC = entry_pc
-            b_first = b_first + cweights[alpha_b + 1] * (curr.col(col::PC) - entry_pc_f);
-            // 2: HALT = 0
-            b_first = b_first + cweights[alpha_b + 2] * curr.col(col::HALT);
-            // 3: I_IN = 0
-            b_first = b_first + cweights[alpha_b + 3] * curr.col(col::I_IN);
-            // 4: I_OUT = 0
-            b_first = b_first + cweights[alpha_b + 4] * curr.col(col::I_OUT);
-            // 5..: accumulators have specific initial values.
             let one = BabyBear::one();
-            b_first = b_first + cweights[alpha_b + 5] * (curr_acc[accum::REG]    - one);
-            b_first = b_first + cweights[alpha_b + 6] * (curr_acc[accum::MEM]    - one);
-            b_first = b_first + cweights[alpha_b + 7] * (curr_acc[accum::PROG]);
-            b_first = b_first + cweights[alpha_b + 8] * (curr_acc[accum::PUB_IN]);
-            b_first = b_first + cweights[alpha_b + 9] * (curr_acc[accum::PUB_OUT]);
+            let mut b_first = BabyBear::zero();
+            b_first = b_first + cweights[alpha_b]     * curr.col(col::CLK);
+            b_first = b_first + cweights[alpha_b + 1] * (curr.col(col::PC) - entry_pc_f);
+            b_first = b_first + cweights[alpha_b + 2] * curr.col(col::HALT);
+            b_first = b_first + cweights[alpha_b + 3] * curr.col(col::I_IN);
+            b_first = b_first + cweights[alpha_b + 4] * curr.col(col::I_OUT);
+            // Per-channel accumulator initial values (4 GP→1, 12 LogUp→0).
+            for ch in 0..NUM_CHANNELS {
+                b_first = b_first + cweights[alpha_b + 5 + ch] * (curr_acc[accum::REG + ch] - one);
+                b_first = b_first + cweights[alpha_b + 5 + NUM_CHANNELS + ch] * (curr_acc[accum::MEM + ch] - one);
+                b_first = b_first + cweights[alpha_b + 5 + 2 * NUM_CHANNELS + ch] * curr_acc[accum::PROG + ch];
+                b_first = b_first + cweights[alpha_b + 5 + 3 * NUM_CHANNELS + ch] * curr_acc[accum::PUB_IN + ch];
+                b_first = b_first + cweights[alpha_b + 5 + 4 * NUM_CHANNELS + ch] * curr_acc[accum::PUB_OUT + ch];
+            }
             let b_first_q = b_first / (x - omega_0);
 
             // Last-row boundary.
@@ -331,11 +329,13 @@ impl ZkvmProver {
         b_first_z = b_first_z + cweights[alpha_b + 2] * trace_at_z[col::HALT];
         b_first_z = b_first_z + cweights[alpha_b + 3] * trace_at_z[col::I_IN];
         b_first_z = b_first_z + cweights[alpha_b + 4] * trace_at_z[col::I_OUT];
-        b_first_z = b_first_z + cweights[alpha_b + 5] * (accum_at_z[accum::REG]    - one);
-        b_first_z = b_first_z + cweights[alpha_b + 6] * (accum_at_z[accum::MEM]    - one);
-        b_first_z = b_first_z + cweights[alpha_b + 7] * (accum_at_z[accum::PROG]);
-        b_first_z = b_first_z + cweights[alpha_b + 8] * (accum_at_z[accum::PUB_IN]);
-        b_first_z = b_first_z + cweights[alpha_b + 9] * (accum_at_z[accum::PUB_OUT]);
+        for ch in 0..NUM_CHANNELS {
+            b_first_z = b_first_z + cweights[alpha_b + 5 + ch] * (accum_at_z[accum::REG + ch] - one);
+            b_first_z = b_first_z + cweights[alpha_b + 5 + NUM_CHANNELS + ch] * (accum_at_z[accum::MEM + ch] - one);
+            b_first_z = b_first_z + cweights[alpha_b + 5 + 2 * NUM_CHANNELS + ch] * accum_at_z[accum::PROG + ch];
+            b_first_z = b_first_z + cweights[alpha_b + 5 + 3 * NUM_CHANNELS + ch] * accum_at_z[accum::PUB_IN + ch];
+            b_first_z = b_first_z + cweights[alpha_b + 5 + 4 * NUM_CHANNELS + ch] * accum_at_z[accum::PUB_OUT + ch];
+        }
         let b_first_qz = b_first_z / (z - one);
 
         let alpha_l = total_constraints + num_b_first;

@@ -14,7 +14,7 @@ use toyni::transcript::FiatShamirTranscript;
 use zkvm_air::{
     eval_transition_constraints, num_transition_constraints, permutation, TraceView,
 };
-use zkvm_core::{accum, col, NUM_ACCUM_COLS, NUM_TRACE_COLS};
+use zkvm_core::{accum, col, NUM_ACCUM_COLS, NUM_CHANNELS, NUM_TRACE_COLS};
 
 use zkvm_prover::{
     MerkleOpening, ScalarOpening, ZkvmProof, BLOWUP, COSET_SHIFT, NUM_QUERIES,
@@ -67,7 +67,7 @@ impl ZkvmVerifier {
         let num_main = num_transition_constraints();
         let num_accum = permutation::num_accum_constraints();
         let total_constraints = num_main + num_accum;
-        let num_b_first = 10;
+        let num_b_first = 5 + 5 * NUM_CHANNELS;
         let num_b_last = 1;
         let total_with_boundary = total_constraints + num_b_first + num_b_last;
 
@@ -115,11 +115,13 @@ impl ZkvmVerifier {
         b_first_z = b_first_z + cweights[alpha_b + 2] * proof.trace_at_z[col::HALT];
         b_first_z = b_first_z + cweights[alpha_b + 3] * proof.trace_at_z[col::I_IN];
         b_first_z = b_first_z + cweights[alpha_b + 4] * proof.trace_at_z[col::I_OUT];
-        b_first_z = b_first_z + cweights[alpha_b + 5] * (proof.accum_at_z[accum::REG]    - one);
-        b_first_z = b_first_z + cweights[alpha_b + 6] * (proof.accum_at_z[accum::MEM]    - one);
-        b_first_z = b_first_z + cweights[alpha_b + 7] * (proof.accum_at_z[accum::PROG]);
-        b_first_z = b_first_z + cweights[alpha_b + 8] * (proof.accum_at_z[accum::PUB_IN]);
-        b_first_z = b_first_z + cweights[alpha_b + 9] * (proof.accum_at_z[accum::PUB_OUT]);
+        for ch in 0..NUM_CHANNELS {
+            b_first_z = b_first_z + cweights[alpha_b + 5 + ch] * (proof.accum_at_z[accum::REG + ch] - one);
+            b_first_z = b_first_z + cweights[alpha_b + 5 + NUM_CHANNELS + ch] * (proof.accum_at_z[accum::MEM + ch] - one);
+            b_first_z = b_first_z + cweights[alpha_b + 5 + 2 * NUM_CHANNELS + ch] * proof.accum_at_z[accum::PROG + ch];
+            b_first_z = b_first_z + cweights[alpha_b + 5 + 3 * NUM_CHANNELS + ch] * proof.accum_at_z[accum::PUB_IN + ch];
+            b_first_z = b_first_z + cweights[alpha_b + 5 + 4 * NUM_CHANNELS + ch] * proof.accum_at_z[accum::PUB_OUT + ch];
+        }
         let b_first_qz = b_first_z / (z - one);
 
         let alpha_l = total_constraints + num_b_first;

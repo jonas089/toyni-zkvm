@@ -283,24 +283,32 @@ pub mod col {
     pub const PUB_IN: usize = 70;
     pub const PUB_OUT: usize = 73;
 
-    pub const NUM_COLS: usize = 76;
+    /// Bit decomposition of (sort-diff - 1) for range-checking the sorted
+    /// table's ordering. 4 transitions × 16 bits = 64 columns.
+    ///   AB: B-vs-A inside the row (sorted register slots)
+    ///   BC: C-vs-B inside the row
+    ///   CA: A[i+1]-vs-C[i] across rows
+    ///   M : sorted memory next-row vs current-row
+    pub const DIFF_BITS_AB: usize = 76;
+    pub const DIFF_BITS_BC: usize = 92;
+    pub const DIFF_BITS_CA: usize = 108;
+    pub const DIFF_BITS_M : usize = 124;
+
+    pub const NUM_COLS: usize = 140;
 }
 
 pub const NUM_TRACE_COLS: usize = col::NUM_COLS;
 
-/// Permutation accumulators (one per channel):
-///   0: register-file (grand product)
-///   1: memory (grand product)
-///   2: program-ROM (LogUp)
-///   3: public-input (LogUp)
-///   4: public-output (LogUp)
-pub const NUM_ACCUM_COLS: usize = 5;
+/// 5 arguments × 4 channels = 20 accumulator columns.
+/// Layout: arg X channel ch lives at index (X_BASE + ch).
+pub const NUM_ACCUM_COLS: usize = 20;
+pub const NUM_CHANNELS: usize = 4;
 pub mod accum {
-    pub const REG: usize = 0;
-    pub const MEM: usize = 1;
-    pub const PROG: usize = 2;
-    pub const PUB_IN: usize = 3;
-    pub const PUB_OUT: usize = 4;
+    pub const REG: usize = 0;       // 0..3 (grand product)
+    pub const MEM: usize = 4;       // 4..7 (grand product)
+    pub const PROG: usize = 8;      // 8..11 (LogUp)
+    pub const PUB_IN: usize = 12;   // 12..15 (LogUp)
+    pub const PUB_OUT: usize = 16;  // 16..19 (LogUp)
 }
 
 // ── Trace builder ─────────────────────────────────────────────────────
@@ -352,7 +360,10 @@ pub fn build_columns(
     for i in n_real..n {
         for _ in 0..3 { accs.push((0, 0, i as u32, 0)); }
     }
-    accs.sort_by_key(|t| (t.0, t.2));
+    // Sort by (idx, clk, is_write) so reads come before writes within the
+    // same (idx, clk) — this preserves "read sees the old value, then the
+    // write commits the new value" semantics.
+    accs.sort_by_key(|t| (t.0, t.2, t.3));
     for (i, chunk) in accs.chunks(3).enumerate() {
         write_sreg(&mut cols, i, chunk);
     }
@@ -476,42 +487,107 @@ fn write_smem(cols: &mut [Vec<BabyBear>], i: usize, e: (u32, u32, u32, u32, u32)
 fn fill_aux(cols: &mut [Vec<BabyBear>]) {
     let n = cols[0].len();
 
-    // Sorted-reg cross-slot aux: (B vs A in row), (C vs B in row), (A[i+1] vs C[i]).
+    // Sorted-reg cross-slot aux + diff bit decomposition.
     for i in 0..n {
-        let prev = cols[col::SREG_A][i];
-        let next = cols[col::SREG_B][i];
-        write_aux(cols, i, col::SREG_A + 4, prev, next);
-        let prev = cols[col::SREG_B][i];
-        let next = cols[col::SREG_C][i];
-        write_aux(cols, i, col::SREG_B + 4, prev, next);
-        let prev = cols[col::SREG_C][i];
-        let next = if i + 1 < n {
-            cols[col::SREG_A][i + 1]
+        // B vs A in same row.
+        fill_sort_aux_reg(cols, i, col::SREG_A, col::SREG_B, col::SREG_A + 4, col::DIFF_BITS_AB, i + 1 < n);
+        // C vs B in same row.
+        fill_sort_aux_reg(cols, i, col::SREG_B, col::SREG_C, col::SREG_B + 4, col::DIFF_BITS_BC, i + 1 < n);
+        // A[i+1] vs C[i] across rows. The cross-row case looks at row i+1's A.
+        let prev_idx = cols[col::SREG_C][i];
+        let prev_clk = cols[col::SREG_C + 2][i];
+        let (next_idx, next_clk) = if i + 1 < n {
+            (cols[col::SREG_A][i + 1], cols[col::SREG_A + 2][i + 1])
         } else {
-            cols[col::SREG_A][0]
+            (cols[col::SREG_A][0], cols[col::SREG_A + 2][0])
         };
-        write_aux(cols, i, col::SREG_C + 4, prev, next);
+        fill_sort_aux_with_clks(cols, i, col::SREG_C + 4, col::DIFF_BITS_CA,
+            prev_idx, prev_clk, next_idx, next_clk, i + 1 < n);
     }
 
-    // Sorted-mem aux: (next row vs current row).
+    // Sorted-mem aux + diff bit decomposition.
     for i in 0..n {
-        let prev = cols[col::SMEM][i];
-        let next = if i + 1 < n {
-            cols[col::SMEM][i + 1]
+        let prev_addr = cols[col::SMEM][i];
+        let prev_clk  = cols[col::SMEM + 2][i];
+        let (next_addr, next_clk) = if i + 1 < n {
+            (cols[col::SMEM][i + 1], cols[col::SMEM + 2][i + 1])
         } else {
-            cols[col::SMEM][0]
+            (cols[col::SMEM][0], cols[col::SMEM + 2][0])
         };
-        write_aux(cols, i, col::SMEM + 5, prev, next);
+        fill_sort_aux_with_clks(cols, i, col::SMEM + 5, col::DIFF_BITS_M,
+            prev_addr, prev_clk, next_addr, next_clk, i + 1 < n);
     }
 }
 
-fn write_aux(cols: &mut [Vec<BabyBear>], i: usize, base: usize, prev: BabyBear, next: BabyBear) {
-    if prev == next {
-        cols[base    ][i] = BabyBear::one();
-        cols[base + 1][i] = BabyBear::zero();
+/// Fill same_idx + diff_inv aux for a register slot transition WITHIN the same row.
+fn fill_sort_aux_reg(
+    cols: &mut [Vec<BabyBear>],
+    i: usize,
+    prev_base: usize,
+    next_base: usize,
+    aux_base: usize,
+    bits_base: usize,
+    is_in_trace: bool,
+) {
+    let prev_idx = cols[prev_base    ][i];
+    let prev_clk = cols[prev_base + 2][i];
+    let next_idx = cols[next_base    ][i];
+    let next_clk = cols[next_base + 2][i];
+    fill_sort_aux_with_clks(cols, i, aux_base, bits_base,
+        prev_idx, prev_clk, next_idx, next_clk, is_in_trace);
+}
+
+/// Common path: fill (same_idx, diff_inv) at aux_base and the 16-bit
+/// decomposition of (diff - 1) at bits_base.
+///
+/// `is_in_trace` is `false` only when this transition is the last-row →
+/// first-row wrap; in that case the diff doesn't fit the strict-ordering
+/// shape (it's "negative") so we leave the bits at zero. The AIR marks the
+/// range-check constraint as a main transition so it's excepted at the
+/// last row.
+fn fill_sort_aux_with_clks(
+    cols: &mut [Vec<BabyBear>],
+    i: usize,
+    aux_base: usize,
+    bits_base: usize,
+    prev_idx: BabyBear,
+    prev_clk: BabyBear,
+    next_idx: BabyBear,
+    next_clk: BabyBear,
+    is_in_trace: bool,
+) {
+    let same = prev_idx == next_idx;
+    if same {
+        cols[aux_base    ][i] = BabyBear::one();
+        cols[aux_base + 1][i] = BabyBear::zero();
     } else {
-        cols[base    ][i] = BabyBear::zero();
-        cols[base + 1][i] = (next - prev).inverse();
+        cols[aux_base    ][i] = BabyBear::zero();
+        cols[aux_base + 1][i] = (next_idx - prev_idx).inverse();
+    }
+
+    if !is_in_trace {
+        // Wrap row: leave bits at zero; the AIR exempts this row.
+        return;
+    }
+
+    // diff = same ? (next_clk - prev_clk) : (next_idx - prev_idx).
+    // Honest sort produces diff ∈ [0, 2^16) (consecutive same-(idx,clk,wr)
+    // tuples can repeat with diff=0; differing tuples are monotone with
+    // diff > 0). We encode diff directly as 16 boolean bits. A reversed
+    // ordering yields diff ≈ 2^31 in the field, which exceeds the 16-bit
+    // budget and the bit-recon constraint catches it.
+    let v = if same {
+        let nc = next_clk.value as i64;
+        let pc = prev_clk.value as i64;
+        (nc - pc) as u64
+    } else {
+        let ni = next_idx.value as i64;
+        let pi = prev_idx.value as i64;
+        (ni - pi) as u64
+    };
+    for k in 0..16 {
+        let bit = ((v >> k) & 1) as u32;
+        cols[bits_base + k][i] = BabyBear::from_u32(bit);
     }
 }
 

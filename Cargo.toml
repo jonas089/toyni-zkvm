@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-toyni = { path = "../toyni" }
+toyni = { git = "https://github.com/jonas089/toyni" }
 zkvm-core = { path = "crates/zkvm-core" }
 zkvm-air = { path = "crates/zkvm-air" }
 zkvm-prover = { path = "crates/zkvm-prover" }

@@ -155,6 +155,7 @@ dependencies = [
 [[package]]
 name = "toyni"
 version = "0.1.0"
+source = "git+https://github.com/jonas089/toyni?branch=ext-field-soundness#66b90ce920b0188157b4d9885bde7ce00037d159"
 dependencies = [
  "rand",
  "sha2",

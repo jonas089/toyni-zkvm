@@ -12,11 +12,14 @@ proving backend.
 ## Status
 
 - **Toyni (proving backend)**: solid. Core STARK toolkit + CUDA NTT path.
-- **zkvm (this repo)**: *the AIR / constraint system is still under
-  review*. Substantial portions of the constraints were drafted with
-  Claude's assistance. The ISA is small enough to walk through end to
-  end, but several deliberate v1 simplifications mean the prover is
-  not strongly sound (see "Known soundness gaps" below).
+- **zkvm (this repo)**: the AIR aims to be a *fully constrained* minimal
+  VM — every trace column is fixed by a transition/boundary constraint or
+  bound by a permutation/lookup argument, leaving the prover no
+  unconstrained freedom. The earlier v1 soundness gaps (un-range-checked
+  ordering, unbound init values, free post-halt rows, negative LogUp
+  multiplicities) are closed; see "Soundness" below. Substantial portions
+  of the constraints were drafted with Claude's assistance and the system
+  has **not** been audited.
 
 Getting an instruction-set + AIR + proving pipeline right end-to-end is
 genuinely ambitious for a single person. I'm working on it as a side
@@ -160,19 +163,34 @@ The AIR enforces:
   opcodes' constraints on the same row or none at all.
 - **Register-file consistency.** Three register-access slots per row
   enter a 4-channel grand-product permutation against a sorted table.
-  Within the sorted table, read-after-write constraints force any read
-  of a register to return the most recent write's value, and a fresh
-  register (first time it appears in the sort) read returns 0. Cross-slot
-  transitions (B vs A, C vs B, A[i+1] vs C[i]) are all constrained.
+  Each slot carries an explicit **activity flag**: an inactive slot is
+  forced fully zero, and each opcode is constrained to activate exactly
+  the slots it uses. Within the sorted table, read-after-write constraints
+  force any read of a register to return the most recent write's value, a
+  fresh register read returns 0, and `idx = 0 ⇒ val = 0` (r0) is pinned on
+  every sorted entry. Cross-slot transitions (B vs A, C vs B, A[i+1] vs
+  C[i]) are all constrained.
 - **Memory consistency.** Same shape as the register file with one slot
   per row, gated by a `MEM_USED` flag tied to LOAD/STORE selectors.
-- **Sorted-table ordering range check.** Every sorted-table transition
-  (4 in total) bit-decomposes its sort-key diff into 16 boolean bits.
-  Reversed orderings produce diffs of size ~2³¹ (much greater than 2¹⁶)
-  and the bit-reconstruction constraint catches them.
+- **Strict sorted-table ordering.** Each sorted access carries a unique
+  key — registers use access time `t = clk·3 + slot` (so reading a
+  register twice in one row stays distinct), memory uses `(addr, clk)`
+  with one access per row. Every sorted transition checks
+  `diff = 1 + Σ bitₖ·2ᵏ` over 16 boolean bits, i.e. a *strictly* positive,
+  range-checked step. Reversed orderings produce diffs of size ~2³¹, far
+  outside the bit budget, and the reconstruction constraint catches them.
+  The first entry of each sorted table is bound (r0 pin for registers, a
+  zero init record for memory), closing the "first entry is never a
+  transition target" gap.
+- **Post-halt rows replay HALT.** Once the HALT flag is set, every padding
+  row is constrained to re-select HALT, so it freezes the PC, touches no
+  register/memory/I-O lane, and its ROM lookup matches the real HALT entry.
 - **Program ROM binding.** The (PC, opcode, op_a, op_b, op_c) executed
   on each row is matched (4-channel LogUp) against a Lagrange-bound
-  ROM table whose hash is committed in the proof's public values.
+  ROM table whose hash is committed in the proof's public values. ROM
+  rows are constrained contiguous from PC 0 (so PCs are distinct and
+  gap-free), and each row's LogUp multiplicity is range-checked
+  non-negative, blocking negative-multiplicity cancellation.
 - **Public input/output binding.** READ rows feed `(i_in, val)` into a
   4-channel LogUp against a Lagrange-bound public-input table; WRITE
   rows do the symmetric thing on the output side.
@@ -181,25 +199,38 @@ The AIR enforces:
   HALT monotonicity prevents un-halting.
 - **r0 hardwiring.** Per-row inverse-trick on each register-access slot
   forces `idx=0 ⇒ val=0`.
-- **4-channel permutation arguments.** Each of the 5 multiset arguments
-  runs in 4 parallel γ/α channels for ~2⁻⁶⁰ soundness.
+- **Extension-field challenges.** The trace is committed over the base
+  field BabyBear (~31 bits), but every random challenge — the lookup /
+  permutation γ and α, the out-of-domain point, and the FRI folding βs —
+  is drawn from the quartic extension `BabyBear[X]/(X⁴−11)` (~124 bits).
+  The accumulators, quotient, DEEP composition and FRI layers are therefore
+  extension-valued. This lifts the soundness of every randomized argument
+  off the small base field. (Multiple γ/α channels are retained as belt-
+  and-suspenders.)
+- **Program pinning.** `verify(proof, expected_program_hash, expected_entry_pc)`
+  rejects unless the proof's program hash and entry point match what the
+  caller supplies, so a passing proof certifies *your* program ran — not
+  merely *some* self-consistent program.
 
 ### Known limitations
 
-- **Memory addresses are implicitly assumed to fit in 16 bits.** The
-  sorted-memory ordering range check uses 16-bit decomposition of the
-  address diff, so addresses outside `[0, 2¹⁶)` would overflow. The
-  fibonacci example doesn't touch memory; programs that do should keep
-  addresses small. Fixing this means range-checking the address itself
-  too, which adds another decomposition.
-- **Bit-decomposition isn't multiplicity-checked.** A malicious prover
-  can set bit columns to non-boolean values, but the booleanity
-  constraints `bit * (bit - 1) = 0` are enforced inside the AIR — so
-  this is closed.
+- **16-bit ordering / range budget.** Sorted-table diffs and ROM
+  multiplicities are decomposed into 16 boolean bits, so the bound
+  `2¹⁶ > 3·trace_len` and `2¹⁶ > max memory address` must hold. For the
+  default trace length (a few hundred rows) this is comfortable; very long
+  traces or large memory addresses would need a wider decomposition
+  (`col::DIFF_BITS`). The booleanity of every bit is itself constrained
+  inside the AIR.
+- **Last-row exception.** All *main* transition constraints are excepted on
+  the final trace row (a padding HALT row); only the cyclic accumulator
+  arguments hold there. See the AIR module docs.
+- **Not audited.** This is research / hobby code; see the caution at the
+  top.
 
 This is meant to be reviewable by hand. The whole AIR is one file
-(`crates/zkvm-air/src/lib.rs`, ~430 lines). If you find a gap,
-please open an issue or PR.
+(`crates/zkvm-air/src/lib.rs`), with adversarial unit tests (`cargo test
+-p zkvm-air`) that tamper an honest trace to confirm each constraint
+fires. If you find a gap, please open an issue or PR.
 
 ## Development
 

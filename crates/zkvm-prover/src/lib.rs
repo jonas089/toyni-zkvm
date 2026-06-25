@@ -6,8 +6,9 @@
 
 use sha2::{Digest, Sha256};
 use toyni::babybear::BabyBear;
+use toyni::ext::Ext;
 use toyni::math::domain::BabyBearDomain;
-use toyni::math::fri::fri_fold;
+use toyni::math::fri::fri_fold_ext;
 use toyni::math::polynomial::Polynomial;
 use toyni::merkle::{MerkleProof, MerkleTree};
 use toyni::transcript::FiatShamirTranscript;
@@ -17,16 +18,43 @@ use zkvm_air::{
 };
 use zkvm_core::{accum, col, NUM_ACCUM_COLS, NUM_CHANNELS, NUM_TRACE_COLS};
 
+/// Evaluate a base-field-coefficient polynomial at an extension point.
+fn eval_base_at_ext(coeffs: &[BabyBear], z: Ext) -> Ext {
+    let mut acc = Ext::zero();
+    for &c in coeffs.iter().rev() {
+        acc = acc * z + Ext::from(c);
+    }
+    acc
+}
+
+/// Evaluate an extension-field-coefficient polynomial at an extension point.
+fn eval_ext_at_ext(coeffs: &[Ext], z: Ext) -> Ext {
+    let mut acc = Ext::zero();
+    for &c in coeffs.iter().rev() {
+        acc = acc * z + c;
+    }
+    acc
+}
+
 pub const NUM_QUERIES: usize = 44;
 pub const BLOWUP: usize = 8;
 pub const COSET_SHIFT: u64 = 7;
 
 // ── proof data structures ─────────────────────────────────────────────
 
+/// Opening of a base-field committed row (the trace).
 #[derive(Debug, Clone)]
 pub struct MerkleOpening {
     pub index: usize,
     pub values: Vec<BabyBear>,
+    pub proof: MerkleProof,
+}
+
+/// Opening of an extension-field committed row (the accumulators).
+#[derive(Debug, Clone)]
+pub struct MerkleOpeningExt {
+    pub index: usize,
+    pub values: Vec<Ext>,
     pub proof: MerkleProof,
 }
 
@@ -35,18 +63,19 @@ pub struct QueryProof {
     pub index: usize,
     pub trace_opening: MerkleOpening,
     pub trace_opening_g: MerkleOpening,
-    pub accum_opening: MerkleOpening,
-    pub accum_opening_g: MerkleOpening,
+    pub accum_opening: MerkleOpeningExt,
+    pub accum_opening_g: MerkleOpeningExt,
     pub quotient_opening: ScalarOpening,
     pub deep_opening: ScalarOpening,
     pub deep_opening_pair: ScalarOpening,
     pub fri_openings: Vec<(ScalarOpening, ScalarOpening)>,
 }
 
+/// Opening of a single extension-field committed value (quotient / DEEP / FRI).
 #[derive(Debug, Clone)]
 pub struct ScalarOpening {
     pub index: usize,
-    pub value: BabyBear,
+    pub value: Ext,
     pub proof: MerkleProof,
 }
 
@@ -61,17 +90,17 @@ pub struct ZkvmProof {
     pub accum_commitment: Vec<u8>,
     pub quotient_commitment: Vec<u8>,
 
-    pub trace_at_z: Vec<BabyBear>,
-    pub trace_at_gz: Vec<BabyBear>,
-    pub accum_at_z: Vec<BabyBear>,
-    pub accum_at_gz: Vec<BabyBear>,
-    pub q_z: BabyBear,
+    pub trace_at_z: Vec<Ext>,
+    pub trace_at_gz: Vec<Ext>,
+    pub accum_at_z: Vec<Ext>,
+    pub accum_at_gz: Vec<Ext>,
+    pub q_z: Ext,
 
-    pub gammas: [BabyBear; 4],
-    pub alphas: [BabyBear; 4],
+    pub gammas: [Ext; 4],
+    pub alphas: [Ext; 4],
 
     pub fri_commitments: Vec<Vec<u8>>,
-    pub fri_final_value: BabyBear,
+    pub fri_final_value: Ext,
     pub query_proofs: Vec<QueryProof>,
 
     pub program_hash: [u8; 32],
@@ -153,13 +182,15 @@ impl ZkvmProver {
         transcript.absorb_commitment(&trace_commitment);
 
         // ── Phase 2: accumulators ────────────────────────────────────
-        let gammas: [BabyBear; 4] = [
-            transcript.squeeze_challenge(), transcript.squeeze_challenge(),
-            transcript.squeeze_challenge(), transcript.squeeze_challenge(),
+        // Lookup / permutation challenges are drawn from the extension field
+        // for ~124-bit soundness.
+        let gammas: [Ext; 4] = [
+            transcript.squeeze_ext_challenge(), transcript.squeeze_ext_challenge(),
+            transcript.squeeze_ext_challenge(), transcript.squeeze_ext_challenge(),
         ];
-        let alphas: [BabyBear; 4] = [
-            transcript.squeeze_challenge(), transcript.squeeze_challenge(),
-            transcript.squeeze_challenge(), transcript.squeeze_challenge(),
+        let alphas: [Ext; 4] = [
+            transcript.squeeze_ext_challenge(), transcript.squeeze_ext_challenge(),
+            transcript.squeeze_ext_challenge(), transcript.squeeze_ext_challenge(),
         ];
 
         let t = std::time::Instant::now();
@@ -175,11 +206,11 @@ impl ZkvmProver {
 
         let t = std::time::Instant::now();
         eprintln!("[prove] [2/8] accum IFFT + LDE FFT ({} cols)...", NUM_ACCUM_COLS);
-        let accum_polys: Vec<Vec<BabyBear>> = accum_columns.iter().map(|c| domain.ifft(c)).collect();
-        let accum_lde: Vec<Vec<BabyBear>> = accum_polys.iter().map(|c| shifted_domain.fft(c)).collect();
+        let accum_polys: Vec<Vec<Ext>> = accum_columns.iter().map(|c| domain.ifft_ext(c)).collect();
+        let accum_lde: Vec<Vec<Ext>> = accum_polys.iter().map(|c| shifted_domain.fft_ext(c)).collect();
         eprintln!("[prove] [2/8] accum FFTs done in {:.2?}", t.elapsed());
         let t = std::time::Instant::now();
-        let accum_tree = build_row_merkle_tree(&accum_lde, lde_size);
+        let accum_tree = build_row_merkle_tree_ext(&accum_lde, lde_size);
         let accum_commitment = accum_tree.root().unwrap();
         eprintln!("[prove] [2/8] accum merkle done in {:.2?}", t.elapsed());
         transcript.absorb_commitment(&accum_commitment);
@@ -188,19 +219,22 @@ impl ZkvmProver {
         let num_main = num_transition_constraints();
         let num_accum = permutation::num_accum_constraints();
         let total_constraints = num_main + num_accum;
-        // Boundary: 5 state cells + 5 args × NUM_CHANNELS accumulator inits = 25 first-row;
-        //           HALT=1 = 1 last-row.
-        let num_b_first = 5 + 5 * NUM_CHANNELS;
+        // Boundary first-row: 5 state cells (CLK, PC, HALT, I_IN, I_OUT)
+        //   + 5 args × NUM_CHANNELS accumulator inits
+        //   + ROM entry address (PROG addr[0] = 0)
+        //   + sorted-memory init record (SORTED_BOUNDARY_ENTRY).
+        // Boundary last-row: HALT = 1.
+        let num_b_first = 5 + 5 * NUM_CHANNELS + 2;
         let num_b_last = 1;
         let total_with_boundary = total_constraints + num_b_first + num_b_last;
 
         let z_poly = Polynomial::new(domain.vanishing_poly_coeffs());
         let omega_n_minus_1 = g.pow((trace_len - 1) as u64);
-        let entry_pc_f = BabyBear::from_u32(self.entry_pc);
+        let entry_pc_f = Ext::from_u32(self.entry_pc);
         let omega_0 = BabyBear::one();
 
-        let cweights: Vec<BabyBear> = (0..total_with_boundary)
-            .map(|_| transcript.squeeze_challenge())
+        let cweights: Vec<Ext> = (0..total_with_boundary)
+            .map(|_| transcript.squeeze_ext_challenge())
             .collect();
 
         let t = std::time::Instant::now();
@@ -209,7 +243,7 @@ impl ZkvmProver {
             lde_size
         );
         let progress_step = (lde_size / 16).max(1);
-        let mut q_evals = vec![BabyBear::zero(); lde_size];
+        let mut q_evals = vec![Ext::zero(); lde_size];
         for i in 0..lde_size {
             if i > 0 && i % progress_step == 0 {
                 eprintln!(
@@ -223,8 +257,8 @@ impl ZkvmProver {
             let next_idx = (i + BLOWUP) % lde_size;
             let next = build_trace_view(&trace_lde, next_idx);
 
-            let curr_acc: Vec<BabyBear> = accum_lde.iter().map(|c| c[i]).collect();
-            let next_acc: Vec<BabyBear> = accum_lde.iter().map(|c| c[next_idx]).collect();
+            let curr_acc: Vec<Ext> = accum_lde.iter().map(|c| c[i]).collect();
+            let next_acc: Vec<Ext> = accum_lde.iter().map(|c| c[next_idx]).collect();
 
             let main_cv = eval_transition_constraints(&curr, &next);
             let accum_cv = permutation::eval_accum_constraints(
@@ -232,25 +266,28 @@ impl ZkvmProver {
             );
 
             // Main constraints: all excepted (zeroed at last row).
-            let mut c_excepted = BabyBear::zero();
+            let mut c_excepted = Ext::zero();
             for (j, &v) in main_cv.iter().enumerate() {
                 c_excepted = c_excepted + cweights[j] * v;
             }
             // Accum constraints: all wrap-around (hold everywhere).
-            let mut c_wrap = BabyBear::zero();
+            let mut c_wrap = Ext::zero();
             for (j, &v) in accum_cv.iter().enumerate() {
                 c_wrap = c_wrap + cweights[num_main + j] * v;
             }
 
+            // x, the exception factor and the vanishing value are base-field
+            // (the domain is base); combine with the Ext constraint sums via
+            // cheap base-scalar multiplies / a base inverse.
             let x = shifted_elements[i];
             let exception = x - omega_n_minus_1;
-            let z_val = z_poly.evaluate(x);
-            let transition_q = (c_excepted * exception + c_wrap) / z_val;
+            let z_val_inv = z_poly.evaluate(x).inverse();
+            let transition_q = (c_excepted.mul_base(exception) + c_wrap).mul_base(z_val_inv);
 
             // First-row boundaries.
             let alpha_b = total_constraints;
-            let one = BabyBear::one();
-            let mut b_first = BabyBear::zero();
+            let one = Ext::one();
+            let mut b_first = Ext::zero();
             b_first = b_first + cweights[alpha_b]     * curr.col(col::CLK);
             b_first = b_first + cweights[alpha_b + 1] * (curr.col(col::PC) - entry_pc_f);
             b_first = b_first + cweights[alpha_b + 2] * curr.col(col::HALT);
@@ -264,12 +301,18 @@ impl ZkvmProver {
                 b_first = b_first + cweights[alpha_b + 5 + 3 * NUM_CHANNELS + ch] * curr_acc[accum::PUB_IN + ch];
                 b_first = b_first + cweights[alpha_b + 5 + 4 * NUM_CHANNELS + ch] * curr_acc[accum::PUB_OUT + ch];
             }
-            let b_first_q = b_first / (x - omega_0);
+            // ROM entry address: first ROM row is PC 0 (ROM_ENTRY_WELLFORMED).
+            let rom_b = total_constraints + 5 + 5 * NUM_CHANNELS;
+            b_first = b_first + cweights[rom_b] * curr.col(col::PROG);
+            // Sorted-memory init record: first entry, if a used read, has val 0.
+            let smem_init = curr.col(col::SMEM + 4) * (one - curr.col(col::SMEM + 3)) * curr.col(col::SMEM + 1);
+            b_first = b_first + cweights[rom_b + 1] * smem_init;
+            let b_first_q = b_first.mul_base((x - omega_0).inverse());
 
             // Last-row boundary.
             let alpha_l = total_constraints + num_b_first;
             let b_last = cweights[alpha_l] * (curr.col(col::HALT) - one);
-            let b_last_q = b_last / (x - omega_n_minus_1);
+            let b_last_q = b_last.mul_base((x - omega_n_minus_1).inverse());
 
             q_evals[i] = transition_q + b_first_q + b_last_q;
         }
@@ -278,7 +321,7 @@ impl ZkvmProver {
         // ── Phase 4: commit quotient ─────────────────────────────────
         let t = std::time::Instant::now();
         eprintln!("[prove] [4/8] quotient merkle...");
-        let q_tree = build_scalar_merkle_tree(&q_evals);
+        let q_tree = build_scalar_merkle_tree_ext(&q_evals);
         let quotient_commitment = q_tree.root().unwrap();
         eprintln!("[prove] [4/8] done in {:.2?}", t.elapsed());
         transcript.absorb_commitment(&quotient_commitment);
@@ -287,22 +330,15 @@ impl ZkvmProver {
         let t = std::time::Instant::now();
         eprintln!("[prove] [5/8] OOD evaluation...");
         let z = derive_z(&mut transcript, &extended_domain, &shifted_domain);
+        let gz = z.mul_base(g);
 
-        let trace_at_z: Vec<BabyBear> = trace_polys.iter()
-            .map(|c| Polynomial::new(c.clone()).evaluate(z))
-            .collect();
-        let trace_at_gz: Vec<BabyBear> = trace_polys.iter()
-            .map(|c| Polynomial::new(c.clone()).evaluate(g * z))
-            .collect();
-        let accum_at_z: Vec<BabyBear> = accum_polys.iter()
-            .map(|c| Polynomial::new(c.clone()).evaluate(z))
-            .collect();
-        let accum_at_gz: Vec<BabyBear> = accum_polys.iter()
-            .map(|c| Polynomial::new(c.clone()).evaluate(g * z))
-            .collect();
+        let trace_at_z: Vec<Ext> = trace_polys.iter().map(|c| eval_base_at_ext(c, z)).collect();
+        let trace_at_gz: Vec<Ext> = trace_polys.iter().map(|c| eval_base_at_ext(c, gz)).collect();
+        let accum_at_z: Vec<Ext> = accum_polys.iter().map(|c| eval_ext_at_ext(c, z)).collect();
+        let accum_at_gz: Vec<Ext> = accum_polys.iter().map(|c| eval_ext_at_ext(c, gz)).collect();
 
-        let q_coeffs = shifted_domain.ifft(&q_evals);
-        let q_z = Polynomial::new(q_coeffs).evaluate(z);
+        let q_coeffs = shifted_domain.ifft_ext(&q_evals);
+        let q_z = eval_ext_at_ext(&q_coeffs, z);
 
         // Reconstruct q(z) and verify it matches.
         let curr_z = TraceView { vals: trace_at_z.clone() };
@@ -311,19 +347,21 @@ impl ZkvmProver {
         let accum_cv = permutation::eval_accum_constraints(
             &curr_z, &next_gz, &accum_at_z, &accum_at_gz, &gammas, &alphas,
         );
-        let mut c_excepted_z = BabyBear::zero();
+        let mut c_excepted_z = Ext::zero();
         for (j, &v) in main_cv.iter().enumerate() {
             c_excepted_z = c_excepted_z + cweights[j] * v;
         }
-        let mut c_wrap_z = BabyBear::zero();
+        let mut c_wrap_z = Ext::zero();
         for (j, &v) in accum_cv.iter().enumerate() {
             c_wrap_z = c_wrap_z + cweights[num_main + j] * v;
         }
-        let transition_q_z = (c_excepted_z * (z - omega_n_minus_1) + c_wrap_z) / z_poly.evaluate(z);
+        let omega_nm1_e = Ext::from(omega_n_minus_1);
+        let z_at_z = eval_base_at_ext(z_poly.coefficients(), z);
+        let transition_q_z = (c_excepted_z * (z - omega_nm1_e) + c_wrap_z) * z_at_z.inverse();
 
-        let one = BabyBear::one();
+        let one = Ext::one();
         let alpha_b = total_constraints;
-        let mut b_first_z = BabyBear::zero();
+        let mut b_first_z = Ext::zero();
         b_first_z = b_first_z + cweights[alpha_b]     * trace_at_z[col::CLK];
         b_first_z = b_first_z + cweights[alpha_b + 1] * (trace_at_z[col::PC] - entry_pc_f);
         b_first_z = b_first_z + cweights[alpha_b + 2] * trace_at_z[col::HALT];
@@ -336,26 +374,30 @@ impl ZkvmProver {
             b_first_z = b_first_z + cweights[alpha_b + 5 + 3 * NUM_CHANNELS + ch] * accum_at_z[accum::PUB_IN + ch];
             b_first_z = b_first_z + cweights[alpha_b + 5 + 4 * NUM_CHANNELS + ch] * accum_at_z[accum::PUB_OUT + ch];
         }
-        let b_first_qz = b_first_z / (z - one);
+        let rom_b = total_constraints + 5 + 5 * NUM_CHANNELS;
+        b_first_z = b_first_z + cweights[rom_b] * trace_at_z[col::PROG];
+        let smem_init_z = trace_at_z[col::SMEM + 4] * (one - trace_at_z[col::SMEM + 3]) * trace_at_z[col::SMEM + 1];
+        b_first_z = b_first_z + cweights[rom_b + 1] * smem_init_z;
+        let b_first_qz = b_first_z * (z - one).inverse();
 
         let alpha_l = total_constraints + num_b_first;
         let b_last_z = cweights[alpha_l] * (trace_at_z[col::HALT] - one);
-        let b_last_qz = b_last_z / (z - omega_n_minus_1);
+        let b_last_qz = b_last_z * (z - omega_nm1_e).inverse();
 
         let computed_q_z = transition_q_z + b_first_qz + b_last_qz;
         assert_eq!(computed_q_z, q_z, "OOD constraint check failed");
         eprintln!("[prove] [5/8] done in {:.2?}", t.elapsed());
 
-        for &v in &trace_at_z { transcript.absorb_field(v); }
-        for &v in &trace_at_gz { transcript.absorb_field(v); }
-        for &v in &accum_at_z { transcript.absorb_field(v); }
-        for &v in &accum_at_gz { transcript.absorb_field(v); }
-        transcript.absorb_field(q_z);
+        for &v in &trace_at_z { transcript.absorb_ext(v); }
+        for &v in &trace_at_gz { transcript.absorb_ext(v); }
+        for &v in &accum_at_z { transcript.absorb_ext(v); }
+        for &v in &accum_at_gz { transcript.absorb_ext(v); }
+        transcript.absorb_ext(q_z);
 
         // ── Phase 6: DEEP ────────────────────────────────────────────
         let num_deep_terms = 2 * num_cols + 2 * NUM_ACCUM_COLS + 1;
-        let deep_coeffs: Vec<BabyBear> = (0..num_deep_terms)
-            .map(|_| transcript.squeeze_challenge())
+        let deep_coeffs: Vec<Ext> = (0..num_deep_terms)
+            .map(|_| transcript.squeeze_ext_challenge())
             .collect();
 
         let t = std::time::Instant::now();
@@ -364,7 +406,7 @@ impl ZkvmProver {
             lde_size
         );
         let progress_step = (lde_size / 16).max(1);
-        let d_evals: Vec<BabyBear> = (0..lde_size).map(|i| {
+        let d_evals: Vec<Ext> = (0..lde_size).map(|i| {
             if i > 0 && i % progress_step == 0 {
                 eprintln!(
                     "[prove]   DEEP loop {}/{}  ({:.0}%)  elapsed {:.2?}",
@@ -373,19 +415,21 @@ impl ZkvmProver {
                     t.elapsed()
                 );
             }
-            let x = shifted_elements[i];
+            // x is base; the OOD points z, g·z are extension, so the
+            // denominators (x - z) etc. are extension elements.
+            let x = Ext::from(shifted_elements[i]);
             let inv_x_z = (x - z).inverse();
-            let inv_x_gz = (x - g * z).inverse();
+            let inv_x_gz = (x - gz).inverse();
 
-            let mut d = BabyBear::zero();
+            let mut d = Ext::zero();
             let mut ci = 0;
             for col_idx in 0..num_cols {
-                d = d + deep_coeffs[ci] * (trace_lde[col_idx][i] - trace_at_z[col_idx]) * inv_x_z;
+                d = d + deep_coeffs[ci] * (Ext::from(trace_lde[col_idx][i]) - trace_at_z[col_idx]) * inv_x_z;
                 ci += 1;
             }
             let next_i = (i + BLOWUP) % lde_size;
             for col_idx in 0..num_cols {
-                d = d + deep_coeffs[ci] * (trace_lde[col_idx][next_i] - trace_at_gz[col_idx]) * inv_x_gz;
+                d = d + deep_coeffs[ci] * (Ext::from(trace_lde[col_idx][next_i]) - trace_at_gz[col_idx]) * inv_x_gz;
                 ci += 1;
             }
             for col_idx in 0..NUM_ACCUM_COLS {
@@ -404,12 +448,12 @@ impl ZkvmProver {
         // ── Phase 7: FRI ─────────────────────────────────────────────
         let t = std::time::Instant::now();
         eprintln!("[prove] [7/8] FRI commit + folding...");
-        let mut fri_layers: Vec<Vec<BabyBear>> = Vec::new();
+        let mut fri_layers: Vec<Vec<Ext>> = Vec::new();
         let mut fri_trees: Vec<MerkleTree> = Vec::new();
         let mut fri_commitments: Vec<Vec<u8>> = Vec::new();
 
         fri_layers.push(d_evals.clone());
-        let tree0 = build_scalar_merkle_tree(&d_evals);
+        let tree0 = build_scalar_merkle_tree_ext(&d_evals);
         let root0 = tree0.root().unwrap();
         transcript.absorb_commitment(&root0);
         fri_commitments.push(root0);
@@ -419,13 +463,13 @@ impl ZkvmProver {
         let mut xs: Vec<BabyBear> = shifted_elements.clone();
         loop {
             if current.len() <= 1 { break; }
-            let beta = transcript.squeeze_challenge();
-            let folded = fri_fold(&current, &xs, beta);
+            let beta = transcript.squeeze_ext_challenge();
+            let folded = fri_fold_ext(&current, &xs, beta);
             xs.truncate(folded.len());
             for x in &mut xs { *x = *x * *x; }
             let is_constant = folded.iter().all(|v| *v == folded[0]);
             fri_layers.push(folded.clone());
-            let tree = build_scalar_merkle_tree(&folded);
+            let tree = build_scalar_merkle_tree_ext(&folded);
             let root = tree.root().unwrap();
             transcript.absorb_commitment(&root);
             fri_commitments.push(root);
@@ -452,21 +496,21 @@ impl ZkvmProver {
 
             let trace_opening = open_row_merkle(&trace_tree, &trace_lde, qi, num_cols);
             let trace_opening_g = open_row_merkle(&trace_tree, &trace_lde, idx_g, num_cols);
-            let accum_opening = open_row_merkle(&accum_tree, &accum_lde, qi, NUM_ACCUM_COLS);
-            let accum_opening_g = open_row_merkle(&accum_tree, &accum_lde, idx_g, NUM_ACCUM_COLS);
-            let quotient_opening = open_scalar_merkle(&q_tree, &q_evals, qi);
+            let accum_opening = open_row_merkle_ext(&accum_tree, &accum_lde, qi, NUM_ACCUM_COLS);
+            let accum_opening_g = open_row_merkle_ext(&accum_tree, &accum_lde, idx_g, NUM_ACCUM_COLS);
+            let quotient_opening = open_scalar_merkle_ext(&q_tree, &q_evals, qi);
 
             let half0 = fri_layers[0].len() / 2;
-            let deep_opening = open_scalar_merkle(&fri_trees[0], &fri_layers[0], qi);
-            let deep_opening_pair = open_scalar_merkle(&fri_trees[0], &fri_layers[0], qi + half0);
+            let deep_opening = open_scalar_merkle_ext(&fri_trees[0], &fri_layers[0], qi);
+            let deep_opening_pair = open_scalar_merkle_ext(&fri_trees[0], &fri_layers[0], qi + half0);
 
             let mut fri_openings = Vec::new();
             let mut idx = qi;
             for layer_idx in 1..fri_layers.len() - 1 {
                 let half = fri_layers[layer_idx].len() / 2;
                 idx = idx % half;
-                let op = open_scalar_merkle(&fri_trees[layer_idx], &fri_layers[layer_idx], idx);
-                let op_pair = open_scalar_merkle(&fri_trees[layer_idx], &fri_layers[layer_idx], idx + half);
+                let op = open_scalar_merkle_ext(&fri_trees[layer_idx], &fri_layers[layer_idx], idx);
+                let op_pair = open_scalar_merkle_ext(&fri_trees[layer_idx], &fri_layers[layer_idx], idx + half);
                 fri_openings.push((op, op_pair));
             }
 
@@ -501,7 +545,9 @@ impl ZkvmProver {
 // ── helpers ───────────────────────────────────────────────────────────
 
 fn build_trace_view(trace_lde: &[Vec<BabyBear>], row: usize) -> TraceView {
-    TraceView { vals: trace_lde.iter().map(|c| c[row]).collect() }
+    // Lift the base-field trace row into the extension field for constraint
+    // evaluation (base embeds as a + 0X + 0X^2 + 0X^3).
+    TraceView { vals: trace_lde.iter().map(|c| Ext::from(c[row])).collect() }
 }
 
 fn build_row_merkle_tree(cols: &[Vec<BabyBear>], lde_size: usize) -> MerkleTree {
@@ -516,7 +562,19 @@ fn build_row_merkle_tree(cols: &[Vec<BabyBear>], lde_size: usize) -> MerkleTree 
     MerkleTree::new(leaves)
 }
 
-fn build_scalar_merkle_tree(evals: &[BabyBear]) -> MerkleTree {
+fn build_row_merkle_tree_ext(cols: &[Vec<Ext>], lde_size: usize) -> MerkleTree {
+    let num_cols = cols.len();
+    let leaves: Vec<Vec<u8>> = (0..lde_size).map(|i| {
+        let mut h = Sha256::new();
+        for col in 0..num_cols {
+            h.update(cols[col][i].to_bytes());
+        }
+        h.finalize().to_vec()
+    }).collect();
+    MerkleTree::new(leaves)
+}
+
+fn build_scalar_merkle_tree_ext(evals: &[Ext]) -> MerkleTree {
     MerkleTree::new(evals.iter().map(|v| v.to_bytes().to_vec()).collect())
 }
 
@@ -526,27 +584,29 @@ fn open_row_merkle(tree: &MerkleTree, cols: &[Vec<BabyBear>], index: usize, num_
     MerkleOpening { index, values, proof }
 }
 
-fn open_scalar_merkle(tree: &MerkleTree, evals: &[BabyBear], index: usize) -> ScalarOpening {
+fn open_row_merkle_ext(tree: &MerkleTree, cols: &[Vec<Ext>], index: usize, num_cols: usize) -> MerkleOpeningExt {
+    let proof = tree.get_proof(index).expect("Index out of bounds");
+    let values: Vec<Ext> = (0..num_cols).map(|c| cols[c][index]).collect();
+    MerkleOpeningExt { index, values, proof }
+}
+
+fn open_scalar_merkle_ext(tree: &MerkleTree, evals: &[Ext], index: usize) -> ScalarOpening {
     let proof = tree.get_proof(index).expect("Index out of bounds");
     ScalarOpening { index, value: evals[index], proof }
 }
 
+/// Derive the out-of-domain point in the extension field. A random extension
+/// element is outside the base evaluation domain unless it happens to be a base
+/// element (negligible), so we only need to reject the base case to guarantee
+/// z, g·z ∉ domain (keeping the DEEP denominators invertible).
 fn derive_z(
     transcript: &mut FiatShamirTranscript,
-    extended_domain: &BabyBearDomain,
-    shifted_domain: &BabyBearDomain,
-) -> BabyBear {
-    let ext_set: std::collections::HashSet<BabyBear> =
-        extended_domain.elements().into_iter().collect();
-    let shift_set: std::collections::HashSet<BabyBear> =
-        shifted_domain.elements().into_iter().collect();
-    let g = extended_domain.group_gen();
+    _extended_domain: &BabyBearDomain,
+    _shifted_domain: &BabyBearDomain,
+) -> Ext {
     loop {
-        let z = transcript.squeeze_challenge();
-        if !ext_set.contains(&z)
-            && !shift_set.contains(&z)
-            && !shift_set.contains(&(g * z))
-        {
+        let z = transcript.squeeze_ext_challenge();
+        if !z.is_base() {
             return z;
         }
     }

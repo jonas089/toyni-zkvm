@@ -40,6 +40,23 @@ impl Opcode {
     pub fn sel_index(self) -> usize {
         (self as u32 - 1) as usize
     }
+
+    /// Which of the three register-access slots (A, B, C) this opcode uses.
+    /// Mirrors OPCODE_SLOT_ACTIVITY in the AIR. An "active" slot may still
+    /// reference r0 (e.g. `ADD rd, rs, r0` leaves slot B active reading r0).
+    pub fn slot_active(self) -> [bool; 3] {
+        match self {
+            Opcode::Add | Opcode::Sub | Opcode::Mul => [true, true, true],
+            Opcode::Imm => [false, false, true],
+            Opcode::Load => [true, false, true],
+            Opcode::Store => [true, true, false],
+            Opcode::Jmp => [false, false, false],
+            Opcode::Jz => [true, false, false],
+            Opcode::Read => [false, false, true],
+            Opcode::Write => [true, false, false],
+            Opcode::Halt => [false, false, false],
+        }
+    }
 }
 
 pub const NUM_OPCODES: usize = 11;
@@ -242,46 +259,66 @@ pub mod col {
     pub const I_IN: usize = 8;       // i_in_pre (cursor BEFORE this row)
     pub const I_OUT: usize = 9;      // i_out_pre
 
+    // Register-access slots. Each slot is (idx, val, wr, inv, active):
+    //   idx    – register index touched (0 = r0)
+    //   val    – value read/written
+    //   wr     – 1 if this slot writes, 0 if it reads
+    //   inv    – r0 helper: idx^-1 when idx != 0, else 0
+    //   active – 1 if the opcode genuinely uses this slot, else 0. An
+    //            inactive slot is forced fully zero (SLOT_INACTIVE_ZEROED);
+    //            an active slot reading r0 still has idx = val = 0.
     pub const REG_A_IDX: usize = 10;
     pub const REG_A_VAL: usize = 11;
     pub const REG_A_WR: usize = 12;
     pub const REG_A_INV: usize = 13;
-    pub const REG_B_IDX: usize = 14;
-    pub const REG_B_VAL: usize = 15;
-    pub const REG_B_WR: usize = 16;
-    pub const REG_B_INV: usize = 17;
-    pub const REG_C_IDX: usize = 18;
-    pub const REG_C_VAL: usize = 19;
-    pub const REG_C_WR: usize = 20;
-    pub const REG_C_INV: usize = 21;
+    pub const REG_A_ACT: usize = 14;
+    pub const REG_B_IDX: usize = 15;
+    pub const REG_B_VAL: usize = 16;
+    pub const REG_B_WR: usize = 17;
+    pub const REG_B_INV: usize = 18;
+    pub const REG_B_ACT: usize = 19;
+    pub const REG_C_IDX: usize = 20;
+    pub const REG_C_VAL: usize = 21;
+    pub const REG_C_WR: usize = 22;
+    pub const REG_C_INV: usize = 23;
+    pub const REG_C_ACT: usize = 24;
 
-    pub const MEM_ADDR: usize = 22;
-    pub const MEM_VAL: usize = 23;
-    pub const MEM_WR: usize = 24;
-    pub const MEM_USED: usize = 25;
+    pub const MEM_ADDR: usize = 25;
+    pub const MEM_VAL: usize = 26;
+    pub const MEM_WR: usize = 27;
+    pub const MEM_USED: usize = 28;
 
     /// JZ helper: 1 if REG_A_VAL == 0, else 0.
-    pub const JZ_IS_ZERO: usize = 26;
+    pub const JZ_IS_ZERO: usize = 29;
     /// JZ helper: inverse of REG_A_VAL when nonzero, else arbitrary (we set 0).
-    pub const JZ_VAL_INV: usize = 27;
+    pub const JZ_VAL_INV: usize = 30;
 
     /// One-hot opcode selectors (11 columns).
-    pub const SEL_START: usize = 28;
+    pub const SEL_START: usize = 31;
 
-    /// Sorted register table: 3 slots × (idx, val, clk, is_write, same_idx, diff_inv).
-    pub const SREG_A: usize = 39;
-    pub const SREG_B: usize = 45;
-    pub const SREG_C: usize = 51;
+    // Sorted register table: 3 entries per row laid out A, B, C in global
+    // sorted order. Each entry is (idx, val, t, wr, idx_inv, same_idx, diff_inv):
+    //   t        – canonical access time = clk*3 + slot, globally unique so
+    //              the sort is strict (SORTED_STRICT_DIFF)
+    //   idx_inv  – idx^-1 when idx != 0, else 0 (SORTED_R0_PIN)
+    //   same_idx – 1 when this entry shares the previous entry's register
+    //   diff_inv – (next_idx - prev_idx)^-1 when keys differ
+    pub const SREG_A: usize = 42;
+    pub const SREG_B: usize = 49;
+    pub const SREG_C: usize = 56;
 
     /// Sorted memory: (addr, val, clk, is_write, used, same_addr, diff_inv).
-    pub const SMEM: usize = 57;
+    /// clk is unique per row (one memory access per row) so the sort is strict.
+    pub const SMEM: usize = 63;
 
-    /// Program ROM table: (addr, opcode, op_a, op_b, op_c, mult).
-    pub const PROG: usize = 64;
+    /// Program ROM table: (addr, opcode, op_a, op_b, op_c, mult, real).
+    /// `real` is 1 for the program.len() genuine ROM rows (contiguous from
+    /// row 0) and 0 for padding rows; it gates ROM_ENTRY_WELLFORMED.
+    pub const PROG: usize = 70;
 
     /// Public input/output tables: (idx, val, mult).
-    pub const PUB_IN: usize = 70;
-    pub const PUB_OUT: usize = 73;
+    pub const PUB_IN: usize = 77;
+    pub const PUB_OUT: usize = 80;
 
     /// Bit decomposition of (sort-diff - 1) for range-checking the sorted
     /// table's ordering. 4 transitions × 16 bits = 64 columns.
@@ -289,12 +326,23 @@ pub mod col {
     ///   BC: C-vs-B inside the row
     ///   CA: A[i+1]-vs-C[i] across rows
     ///   M : sorted memory next-row vs current-row
-    pub const DIFF_BITS_AB: usize = 76;
-    pub const DIFF_BITS_BC: usize = 92;
-    pub const DIFF_BITS_CA: usize = 108;
-    pub const DIFF_BITS_M : usize = 124;
+    pub const DIFF_BITS_AB: usize = 83;
+    pub const DIFF_BITS_BC: usize = 99;
+    pub const DIFF_BITS_CA: usize = 115;
+    pub const DIFF_BITS_M : usize = 131;
 
-    pub const NUM_COLS: usize = 140;
+    /// Bit decomposition of the program-ROM multiplicity, range-checking it
+    /// non-negative (< 2^16) to block negative-multiplicity LogUp cancellation
+    /// (ROM_MULT_RANGE). Public-tape multiplicities are pinned to 1 by the
+    /// verifier's Lagrange binding, so they need no in-AIR range check.
+    pub const MULT_BITS_PROG: usize = 147;
+
+    pub const NUM_COLS: usize = 163;
+
+    /// Number of bits used for sorted-table ordering and multiplicity range
+    /// checks. Must satisfy 2^DIFF_BITS > 3 * trace_len (register access time
+    /// t = clk*3 + slot is the widest quantity decomposed).
+    pub const DIFF_BITS: usize = 16;
 }
 
 pub const NUM_TRACE_COLS: usize = col::NUM_COLS;
@@ -350,20 +398,22 @@ pub fn build_columns(
         write_main(&mut cols, i, &pad);
     }
 
-    // Sorted register-access table.
+    // Sorted register-access table. Each access carries a canonical time
+    // t = clk*3 + slot, which is globally unique, so sorting by (idx, t)
+    // gives a strictly increasing key (SORTED_STRICT_DIFF). Within a row the
+    // slot order A < B < C places reads (slots A/B) before the write (slot C),
+    // preserving "read sees the old value, then the write commits the new one".
     let mut accs: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(3 * n);
     for r in records.iter() {
-        for &(idx, val, wr) in &r.reg {
-            accs.push((idx, val, r.clk, wr));
+        for (k, &(idx, val, wr)) in r.reg.iter().enumerate() {
+            accs.push((idx, val, r.clk * 3 + k as u32, wr));
         }
     }
     for i in n_real..n {
-        for _ in 0..3 { accs.push((0, 0, i as u32, 0)); }
+        for k in 0..3u32 { accs.push((0, 0, i as u32 * 3 + k, 0)); }
     }
-    // Sort by (idx, clk, is_write) so reads come before writes within the
-    // same (idx, clk) — this preserves "read sees the old value, then the
-    // write commits the new value" semantics.
-    accs.sort_by_key(|t| (t.0, t.2, t.3));
+    // Sort by (idx, t). t already encodes (clk, slot) lexicographically.
+    accs.sort_by_key(|e| (e.0, e.2));
     for (i, chunk) in accs.chunks(3).enumerate() {
         write_sreg(&mut cols, i, chunk);
     }
@@ -377,8 +427,11 @@ pub fn build_columns(
     for i in n_real..n {
         maccs.push((0, 0, i as u32, 0, 0));
     }
-    // Unused entries first (used=0), then used entries sorted by (addr, clk).
-    maccs.sort_by_key(|e| (e.4, e.0, e.2));
+    // Sort by (addr, clk). clk is unique per row (one memory access per row),
+    // so the key is strictly increasing (SORTED_STRICT_DIFF). Unused entries
+    // (addr = 0, val = 0) fall into the addr-0 region and never trigger the
+    // read-after-write / init constraints, which are gated by the `used` flag.
+    maccs.sort_by_key(|e| (e.0, e.2));
     for (i, e) in maccs.iter().enumerate() {
         write_smem(&mut cols, i, *e);
     }
@@ -399,6 +452,11 @@ pub fn build_columns(
         cols[col::PROG + 3][i] = BabyBear::from_u32(ins.b);
         cols[col::PROG + 4][i] = BabyBear::from_u32(ins.c);
         cols[col::PROG + 5][i] = BabyBear::from_u32(m);
+        cols[col::PROG + 6][i] = BabyBear::one(); // real ROM row
+        // Range-check the multiplicity (ROM_MULT_RANGE): m < 2^DIFF_BITS.
+        for k in 0..col::DIFF_BITS {
+            cols[col::MULT_BITS_PROG + k][i] = BabyBear::from_u32((m >> k) & 1);
+        }
     }
     // Any leftover multiplicities (shouldn't happen for honest provers) are dropped.
 
@@ -432,6 +490,7 @@ fn write_main(cols: &mut [Vec<BabyBear>], i: usize, r: &StepRecord) {
     cols[col::I_OUT  ][i] = BabyBear::from_u32(r.i_out_pre);
 
     let bases = [col::REG_A_IDX, col::REG_B_IDX, col::REG_C_IDX];
+    let active = r.instr.op.slot_active();
     for (k, &(idx, val, wr)) in r.reg.iter().enumerate() {
         cols[bases[k]    ][i] = BabyBear::from_u32(idx);
         cols[bases[k] + 1][i] = BabyBear::from_u32(val);
@@ -442,6 +501,8 @@ fn write_main(cols: &mut [Vec<BabyBear>], i: usize, r: &StepRecord) {
         } else {
             cols[bases[k] + 3][i] = BabyBear::from_u32(idx).inverse();
         }
+        // ACTIVE column.
+        cols[bases[k] + 4][i] = BabyBear::from_u32(active[k] as u32);
     }
 
     let (m_addr, m_val, m_wr, m_used) = r.mem;
@@ -467,11 +528,17 @@ fn write_main(cols: &mut [Vec<BabyBear>], i: usize, r: &StepRecord) {
 fn write_sreg(cols: &mut [Vec<BabyBear>], i: usize, chunk: &[(u32, u32, u32, u32)]) {
     let bases = [col::SREG_A, col::SREG_B, col::SREG_C];
     for k in 0..3 {
-        let (idx, val, clk, wr) = if k < chunk.len() { chunk[k] } else { (0, 0, 0, 0) };
+        let (idx, val, t, wr) = if k < chunk.len() { chunk[k] } else { (0, 0, 0, 0) };
         cols[bases[k]    ][i] = BabyBear::from_u32(idx);
         cols[bases[k] + 1][i] = BabyBear::from_u32(val);
-        cols[bases[k] + 2][i] = BabyBear::from_u32(clk);
+        cols[bases[k] + 2][i] = BabyBear::from_u32(t);
         cols[bases[k] + 3][i] = BabyBear::from_u32(wr);
+        // idx_inv for SORTED_R0_PIN: idx == 0 ? 0 : idx^-1.
+        cols[bases[k] + 4][i] = if idx == 0 {
+            BabyBear::zero()
+        } else {
+            BabyBear::from_u32(idx).inverse()
+        };
     }
 }
 
@@ -490,9 +557,9 @@ fn fill_aux(cols: &mut [Vec<BabyBear>]) {
     // Sorted-reg cross-slot aux + diff bit decomposition.
     for i in 0..n {
         // B vs A in same row.
-        fill_sort_aux_reg(cols, i, col::SREG_A, col::SREG_B, col::SREG_A + 4, col::DIFF_BITS_AB, i + 1 < n);
+        fill_sort_aux_reg(cols, i, col::SREG_A, col::SREG_B, col::SREG_A + 5, col::DIFF_BITS_AB, i + 1 < n);
         // C vs B in same row.
-        fill_sort_aux_reg(cols, i, col::SREG_B, col::SREG_C, col::SREG_B + 4, col::DIFF_BITS_BC, i + 1 < n);
+        fill_sort_aux_reg(cols, i, col::SREG_B, col::SREG_C, col::SREG_B + 5, col::DIFF_BITS_BC, i + 1 < n);
         // A[i+1] vs C[i] across rows. The cross-row case looks at row i+1's A.
         let prev_idx = cols[col::SREG_C][i];
         let prev_clk = cols[col::SREG_C + 2][i];
@@ -501,7 +568,7 @@ fn fill_aux(cols: &mut [Vec<BabyBear>]) {
         } else {
             (cols[col::SREG_A][0], cols[col::SREG_A + 2][0])
         };
-        fill_sort_aux_with_clks(cols, i, col::SREG_C + 4, col::DIFF_BITS_CA,
+        fill_sort_aux_with_clks(cols, i, col::SREG_C + 5, col::DIFF_BITS_CA,
             prev_idx, prev_clk, next_idx, next_clk, i + 1 < n);
     }
 
@@ -570,22 +637,22 @@ fn fill_sort_aux_with_clks(
         return;
     }
 
-    // diff = same ? (next_clk - prev_clk) : (next_idx - prev_idx).
-    // Honest sort produces diff ∈ [0, 2^16) (consecutive same-(idx,clk,wr)
-    // tuples can repeat with diff=0; differing tuples are monotone with
-    // diff > 0). We encode diff directly as 16 boolean bits. A reversed
-    // ordering yields diff ≈ 2^31 in the field, which exceeds the 16-bit
-    // budget and the bit-recon constraint catches it.
+    // diff = same ? (next_t - prev_t) : (next_idx - prev_idx). Because the
+    // sort key is strictly increasing (t is globally unique, idx strictly
+    // increases between groups), diff >= 1 on every in-trace transition. We
+    // encode (diff - 1) as DIFF_BITS boolean bits (SORTED_STRICT_DIFF). A
+    // reversed ordering yields diff ≈ 2^31 in the field, far exceeding the
+    // bit budget, so the recon constraint catches it.
     let v = if same {
         let nc = next_clk.value as i64;
         let pc = prev_clk.value as i64;
-        (nc - pc) as u64
+        (nc - pc - 1) as u64
     } else {
         let ni = next_idx.value as i64;
         let pi = prev_idx.value as i64;
-        (ni - pi) as u64
+        (ni - pi - 1) as u64
     };
-    for k in 0..16 {
+    for k in 0..col::DIFF_BITS {
         let bit = ((v >> k) & 1) as u32;
         cols[bits_base + k][i] = BabyBear::from_u32(bit);
     }

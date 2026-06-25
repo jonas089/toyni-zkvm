@@ -3,9 +3,15 @@
 //! Replays Fiat-Shamir, checks the OOD constraint quotient, Lagrange-binds
 //! the program ROM / public input / public output tables, and verifies FRI
 //! query openings.
+//!
+//! The trace is committed over the base field, but all random challenges and
+//! the values derived from them (accumulators, quotient, DEEP, FRI) live in the
+//! quartic extension `Ext`, matching the prover. Base trace openings are lifted
+//! into `Ext` when re-deriving the constraint / DEEP values.
 
 use sha2::{Digest, Sha256};
 use toyni::babybear::BabyBear;
+use toyni::ext::Ext;
 use toyni::math::domain::BabyBearDomain;
 use toyni::math::polynomial::Polynomial;
 use toyni::merkle::verify_merkle_proof;
@@ -17,13 +23,31 @@ use zkvm_air::{
 use zkvm_core::{accum, col, NUM_ACCUM_COLS, NUM_CHANNELS, NUM_TRACE_COLS};
 
 use zkvm_prover::{
-    MerkleOpening, ScalarOpening, ZkvmProof, BLOWUP, COSET_SHIFT, NUM_QUERIES,
+    MerkleOpening, MerkleOpeningExt, ScalarOpening, ZkvmProof, BLOWUP, COSET_SHIFT, NUM_QUERIES,
 };
 
 pub struct ZkvmVerifier;
 
 impl ZkvmVerifier {
-    pub fn verify(&self, proof: &ZkvmProof) -> bool {
+    /// Verify a proof against the program and entry point the caller expects.
+    ///
+    /// `expected_program_hash` must be `hash_program(..)` of the program the
+    /// caller authored, and `expected_entry_pc` the entry point they intended.
+    /// Both `proof.program_hash` and `proof.entry_pc` are prover-supplied, so
+    /// without these checks a passing proof only certifies that *some*
+    /// self-consistent program ran — not that it was *your* program. Pinning
+    /// them here is what makes the proof bind to a specific program.
+    pub fn verify(
+        &self,
+        proof: &ZkvmProof,
+        expected_program_hash: &[u8; 32],
+        expected_entry_pc: u32,
+    ) -> bool {
+        // Pin the proof to the caller's program / entry point before doing any
+        // further (expensive) work.
+        if &proof.program_hash != expected_program_hash { return false; }
+        if proof.entry_pc != expected_entry_pc { return false; }
+
         let trace_len = proof.trace_len;
         let lde_size = proof.lde_size;
         let num_cols = proof.num_cols;
@@ -52,13 +76,13 @@ impl ZkvmVerifier {
         transcript.absorb_field(BabyBear::from_u32(proof.public_outputs.len() as u32));
         transcript.absorb_commitment(&proof.trace_commitment);
 
-        let gammas: [BabyBear; 4] = [
-            transcript.squeeze_challenge(), transcript.squeeze_challenge(),
-            transcript.squeeze_challenge(), transcript.squeeze_challenge(),
+        let gammas: [Ext; 4] = [
+            transcript.squeeze_ext_challenge(), transcript.squeeze_ext_challenge(),
+            transcript.squeeze_ext_challenge(), transcript.squeeze_ext_challenge(),
         ];
-        let alphas: [BabyBear; 4] = [
-            transcript.squeeze_challenge(), transcript.squeeze_challenge(),
-            transcript.squeeze_challenge(), transcript.squeeze_challenge(),
+        let alphas: [Ext; 4] = [
+            transcript.squeeze_ext_challenge(), transcript.squeeze_ext_challenge(),
+            transcript.squeeze_ext_challenge(), transcript.squeeze_ext_challenge(),
         ];
         if gammas != proof.gammas || alphas != proof.alphas { return false; }
 
@@ -67,28 +91,29 @@ impl ZkvmVerifier {
         let num_main = num_transition_constraints();
         let num_accum = permutation::num_accum_constraints();
         let total_constraints = num_main + num_accum;
-        let num_b_first = 5 + 5 * NUM_CHANNELS;
+        let num_b_first = 5 + 5 * NUM_CHANNELS + 2;
         let num_b_last = 1;
         let total_with_boundary = total_constraints + num_b_first + num_b_last;
 
-        let cweights: Vec<BabyBear> = (0..total_with_boundary)
-            .map(|_| transcript.squeeze_challenge())
+        let cweights: Vec<Ext> = (0..total_with_boundary)
+            .map(|_| transcript.squeeze_ext_challenge())
             .collect();
 
         transcript.absorb_commitment(&proof.quotient_commitment);
 
-        let z = derive_z_verifier(&mut transcript, &extended_domain, &shifted_domain);
+        let z = derive_z_verifier(&mut transcript);
+        let gz = z.mul_base(g);
 
-        for &v in &proof.trace_at_z { transcript.absorb_field(v); }
-        for &v in &proof.trace_at_gz { transcript.absorb_field(v); }
-        for &v in &proof.accum_at_z { transcript.absorb_field(v); }
-        for &v in &proof.accum_at_gz { transcript.absorb_field(v); }
-        transcript.absorb_field(proof.q_z);
+        for &v in &proof.trace_at_z { transcript.absorb_ext(v); }
+        for &v in &proof.trace_at_gz { transcript.absorb_ext(v); }
+        for &v in &proof.accum_at_z { transcript.absorb_ext(v); }
+        for &v in &proof.accum_at_gz { transcript.absorb_ext(v); }
+        transcript.absorb_ext(proof.q_z);
 
         // ── 2. OOD constraint quotient consistency ───────────────────
-        let omega_n_minus_1 = g.pow((trace_len - 1) as u64);
-        let one = BabyBear::one();
-        let entry_pc_f = BabyBear::from_u32(proof.entry_pc);
+        let omega_nm1 = Ext::from(g.pow((trace_len - 1) as u64));
+        let one = Ext::one();
+        let entry_pc_f = Ext::from_u32(proof.entry_pc);
 
         let curr_z = TraceView { vals: proof.trace_at_z.clone() };
         let next_gz = TraceView { vals: proof.trace_at_gz.clone() };
@@ -98,18 +123,19 @@ impl ZkvmVerifier {
             &curr_z, &next_gz, &proof.accum_at_z, &proof.accum_at_gz, &gammas, &alphas,
         );
 
-        let mut c_excepted = BabyBear::zero();
+        let mut c_excepted = Ext::zero();
         for (j, &v) in main_cv.iter().enumerate() {
             c_excepted = c_excepted + cweights[j] * v;
         }
-        let mut c_wrap = BabyBear::zero();
+        let mut c_wrap = Ext::zero();
         for (j, &v) in accum_cv.iter().enumerate() {
             c_wrap = c_wrap + cweights[num_main + j] * v;
         }
-        let transition_q_z = (c_excepted * (z - omega_n_minus_1) + c_wrap) / z_poly.evaluate(z);
+        let z_at_z = eval_base_at_ext(z_poly.coefficients(), z);
+        let transition_q_z = (c_excepted * (z - omega_nm1) + c_wrap) * z_at_z.inverse();
 
         let alpha_b = total_constraints;
-        let mut b_first_z = BabyBear::zero();
+        let mut b_first_z = Ext::zero();
         b_first_z = b_first_z + cweights[alpha_b]     * proof.trace_at_z[col::CLK];
         b_first_z = b_first_z + cweights[alpha_b + 1] * (proof.trace_at_z[col::PC] - entry_pc_f);
         b_first_z = b_first_z + cweights[alpha_b + 2] * proof.trace_at_z[col::HALT];
@@ -122,11 +148,15 @@ impl ZkvmVerifier {
             b_first_z = b_first_z + cweights[alpha_b + 5 + 3 * NUM_CHANNELS + ch] * proof.accum_at_z[accum::PUB_IN + ch];
             b_first_z = b_first_z + cweights[alpha_b + 5 + 4 * NUM_CHANNELS + ch] * proof.accum_at_z[accum::PUB_OUT + ch];
         }
-        let b_first_qz = b_first_z / (z - one);
+        let rom_b = total_constraints + 5 + 5 * NUM_CHANNELS;
+        b_first_z = b_first_z + cweights[rom_b] * proof.trace_at_z[col::PROG];
+        let smem_init_z = proof.trace_at_z[col::SMEM + 4] * (one - proof.trace_at_z[col::SMEM + 3]) * proof.trace_at_z[col::SMEM + 1];
+        b_first_z = b_first_z + cweights[rom_b + 1] * smem_init_z;
+        let b_first_qz = b_first_z * (z - one).inverse();
 
         let alpha_l = total_constraints + num_b_first;
         let b_last_z = cweights[alpha_l] * (proof.trace_at_z[col::HALT] - one);
-        let b_last_qz = b_last_z / (z - omega_n_minus_1);
+        let b_last_qz = b_last_z * (z - omega_nm1).inverse();
 
         let expected_q_z = transition_q_z + b_first_qz + b_last_qz;
         if expected_q_z != proof.q_z { return false; }
@@ -159,15 +189,24 @@ impl ZkvmVerifier {
             prog_c_v[i]    = BabyBear::from_u32(c);
         }
 
-        if proof.trace_at_z[col::PROG    ] != lagrange(&prog_addr_v, z, &domain) { return false; }
-        if proof.trace_at_z[col::PROG + 1] != lagrange(&prog_op_v,   z, &domain) { return false; }
-        if proof.trace_at_z[col::PROG + 2] != lagrange(&prog_a_v,    z, &domain) { return false; }
-        if proof.trace_at_z[col::PROG + 3] != lagrange(&prog_b_v,    z, &domain) { return false; }
-        if proof.trace_at_z[col::PROG + 4] != lagrange(&prog_c_v,    z, &domain) { return false; }
-        // PROG + 5 is the multiplicity column; the prover supplies it. The
-        // LogUp argument's closure (Z[0] = Z[n] = 0 enforced by boundary)
-        // ensures that any inconsistency between multiplicities and the
-        // execution side fails, so we don't need to bind it directly.
+        // PROG + 6 is the `real` flag: 1 for the genuine ROM rows (a prefix),
+        // 0 for padding. Binding it stops the prover from disabling the in-AIR
+        // ROM_ENTRY_WELLFORMED / ROM_PC_DISTINCT contiguity constraints.
+        let mut prog_real_v = vec![BabyBear::zero(); trace_len];
+        for i in 0..proof.program_rom.len().min(trace_len) {
+            prog_real_v[i] = BabyBear::one();
+        }
+
+        if proof.trace_at_z[col::PROG    ] != lagrange_ext(&prog_addr_v, z, &domain) { return false; }
+        if proof.trace_at_z[col::PROG + 1] != lagrange_ext(&prog_op_v,   z, &domain) { return false; }
+        if proof.trace_at_z[col::PROG + 2] != lagrange_ext(&prog_a_v,    z, &domain) { return false; }
+        if proof.trace_at_z[col::PROG + 3] != lagrange_ext(&prog_b_v,    z, &domain) { return false; }
+        if proof.trace_at_z[col::PROG + 4] != lagrange_ext(&prog_c_v,    z, &domain) { return false; }
+        if proof.trace_at_z[col::PROG + 6] != lagrange_ext(&prog_real_v, z, &domain) { return false; }
+        // PROG + 5 is the multiplicity column; the prover supplies it and the
+        // AIR range-checks it non-negative (ROM_MULT_RANGE). The LogUp closure
+        // (Z[0] = Z[n] = 0 enforced by boundary) ties multiplicities to the
+        // execution side, so we don't bind it directly.
 
         // ── 4. Bind public input table ───────────────────────────────
         let mut in_addr_v = vec![BabyBear::zero(); trace_len];
@@ -179,9 +218,9 @@ impl ZkvmVerifier {
             in_val_v[j]  = BabyBear::from_u32(v);
             in_mult_v[j] = BabyBear::one();
         }
-        if proof.trace_at_z[col::PUB_IN    ] != lagrange(&in_addr_v, z, &domain) { return false; }
-        if proof.trace_at_z[col::PUB_IN + 1] != lagrange(&in_val_v,  z, &domain) { return false; }
-        if proof.trace_at_z[col::PUB_IN + 2] != lagrange(&in_mult_v, z, &domain) { return false; }
+        if proof.trace_at_z[col::PUB_IN    ] != lagrange_ext(&in_addr_v, z, &domain) { return false; }
+        if proof.trace_at_z[col::PUB_IN + 1] != lagrange_ext(&in_val_v,  z, &domain) { return false; }
+        if proof.trace_at_z[col::PUB_IN + 2] != lagrange_ext(&in_mult_v, z, &domain) { return false; }
 
         // ── 5. Bind public output table ──────────────────────────────
         let mut out_addr_v = vec![BabyBear::zero(); trace_len];
@@ -193,22 +232,22 @@ impl ZkvmVerifier {
             out_val_v[j]  = BabyBear::from_u32(v);
             out_mult_v[j] = BabyBear::one();
         }
-        if proof.trace_at_z[col::PUB_OUT    ] != lagrange(&out_addr_v, z, &domain) { return false; }
-        if proof.trace_at_z[col::PUB_OUT + 1] != lagrange(&out_val_v,  z, &domain) { return false; }
-        if proof.trace_at_z[col::PUB_OUT + 2] != lagrange(&out_mult_v, z, &domain) { return false; }
+        if proof.trace_at_z[col::PUB_OUT    ] != lagrange_ext(&out_addr_v, z, &domain) { return false; }
+        if proof.trace_at_z[col::PUB_OUT + 1] != lagrange_ext(&out_val_v,  z, &domain) { return false; }
+        if proof.trace_at_z[col::PUB_OUT + 2] != lagrange_ext(&out_mult_v, z, &domain) { return false; }
 
         // ── 6. Squeeze DEEP coefficients ─────────────────────────────
         let num_deep_terms = 2 * num_cols + 2 * num_accum_cols + 1;
-        let deep_coeffs: Vec<BabyBear> = (0..num_deep_terms)
-            .map(|_| transcript.squeeze_challenge())
+        let deep_coeffs: Vec<Ext> = (0..num_deep_terms)
+            .map(|_| transcript.squeeze_ext_challenge())
             .collect();
 
         // ── 7. Replay FRI commitments / betas ────────────────────────
         if proof.fri_commitments.is_empty() { return false; }
         transcript.absorb_commitment(&proof.fri_commitments[0]);
-        let mut fri_betas = Vec::new();
+        let mut fri_betas: Vec<Ext> = Vec::new();
         for i in 1..proof.fri_commitments.len() {
-            let beta = transcript.squeeze_challenge();
+            let beta = transcript.squeeze_ext_challenge();
             fri_betas.push(beta);
             transcript.absorb_commitment(&proof.fri_commitments[i]);
         }
@@ -229,27 +268,28 @@ impl ZkvmVerifier {
             let idx_g = (qi + BLOWUP) % lde_size;
             if qp.trace_opening_g.index != idx_g { return false; }
             if !verify_row_opening(&qp.trace_opening_g, &proof.trace_commitment, num_cols) { return false; }
-            if !verify_row_opening(&qp.accum_opening, &proof.accum_commitment, num_accum_cols) { return false; }
+            if !verify_row_opening_ext(&qp.accum_opening, &proof.accum_commitment, num_accum_cols) { return false; }
             if qp.accum_opening_g.index != idx_g { return false; }
-            if !verify_row_opening(&qp.accum_opening_g, &proof.accum_commitment, num_accum_cols) { return false; }
+            if !verify_row_opening_ext(&qp.accum_opening_g, &proof.accum_commitment, num_accum_cols) { return false; }
             if !verify_scalar_opening(&qp.quotient_opening, &proof.quotient_commitment) { return false; }
             if !verify_scalar_opening(&qp.deep_opening, &proof.fri_commitments[0]) { return false; }
             if !verify_scalar_opening(&qp.deep_opening_pair, &proof.fri_commitments[0]) { return false; }
 
-            let x_i = shifted_elements[qi];
+            // x is base; z, g·z are extension.
+            let x_i = Ext::from(shifted_elements[qi]);
             let inv_x_z = (x_i - z).inverse();
-            let inv_x_gz = (x_i - g * z).inverse();
+            let inv_x_gz = (x_i - gz).inverse();
 
-            let mut expected_deep = BabyBear::zero();
+            let mut expected_deep = Ext::zero();
             let mut ci = 0;
             for col_idx in 0..num_cols {
                 expected_deep = expected_deep
-                    + deep_coeffs[ci] * (qp.trace_opening.values[col_idx] - proof.trace_at_z[col_idx]) * inv_x_z;
+                    + deep_coeffs[ci] * (Ext::from(qp.trace_opening.values[col_idx]) - proof.trace_at_z[col_idx]) * inv_x_z;
                 ci += 1;
             }
             for col_idx in 0..num_cols {
                 expected_deep = expected_deep
-                    + deep_coeffs[ci] * (qp.trace_opening_g.values[col_idx] - proof.trace_at_gz[col_idx]) * inv_x_gz;
+                    + deep_coeffs[ci] * (Ext::from(qp.trace_opening_g.values[col_idx]) - proof.trace_at_gz[col_idx]) * inv_x_gz;
                 ci += 1;
             }
             for col_idx in 0..num_accum_cols {
@@ -268,11 +308,11 @@ impl ZkvmVerifier {
 
             let a0 = qp.deep_opening.value;
             let b0 = qp.deep_opening_pair.value;
-            let x0 = shifted_elements[qi];
+            let x0_inv = shifted_elements[qi].inverse();
             let mut prev_folded = {
-                let avg = (a0 + b0) * half_inv;
-                let diff = (a0 - b0) * half_inv;
-                avg + diff * fri_betas[0] * x0.inverse()
+                let avg = (a0 + b0).mul_base(half_inv);
+                let diff = (a0 - b0).mul_base(half_inv);
+                avg + diff * fri_betas[0] * Ext::from(x0_inv)
             };
 
             let mut pos = qi;
@@ -291,12 +331,12 @@ impl ZkvmVerifier {
                     if op.value != prev_folded { return false; }
                 } else if op_pair.value != prev_folded { return false; }
 
-                let x = shifted_elements[lo].pow(1u64 << fold_k);
+                let x_inv = shifted_elements[lo].pow(1u64 << fold_k).inverse();
                 let a_l = op.value;
                 let b_l = op_pair.value;
-                let avg = (a_l + b_l) * half_inv;
-                let diff = (a_l - b_l) * half_inv;
-                prev_folded = avg + diff * fri_betas[fold_k] * x.inverse();
+                let avg = (a_l + b_l).mul_base(half_inv);
+                let diff = (a_l - b_l).mul_base(half_inv);
+                prev_folded = avg + diff * fri_betas[fold_k] * Ext::from(x_inv);
                 pos = lo;
             }
 
@@ -307,7 +347,24 @@ impl ZkvmVerifier {
     }
 }
 
+/// Evaluate a base-field-coefficient polynomial at an extension point.
+fn eval_base_at_ext(coeffs: &[BabyBear], z: Ext) -> Ext {
+    let mut acc = Ext::zero();
+    for &c in coeffs.iter().rev() {
+        acc = acc * z + Ext::from(c);
+    }
+    acc
+}
+
 fn verify_row_opening(opening: &MerkleOpening, root: &[u8], num_cols: usize) -> bool {
+    if opening.values.len() != num_cols { return false; }
+    let mut h = Sha256::new();
+    for v in &opening.values { h.update(v.to_bytes()); }
+    let leaf = h.finalize().to_vec();
+    verify_merkle_proof(leaf, &opening.proof, &root.to_vec())
+}
+
+fn verify_row_opening_ext(opening: &MerkleOpeningExt, root: &[u8], num_cols: usize) -> bool {
     if opening.values.len() != num_cols { return false; }
     let mut h = Sha256::new();
     for v in &opening.values { h.update(v.to_bytes()); }
@@ -320,36 +377,29 @@ fn verify_scalar_opening(opening: &ScalarOpening, root: &[u8]) -> bool {
     verify_merkle_proof(leaf, &opening.proof, &root.to_vec())
 }
 
-fn lagrange(values: &[BabyBear], z: BabyBear, domain: &BabyBearDomain) -> BabyBear {
+/// Barycentric-style Lagrange evaluation of a base-valued table at the
+/// extension point z: `(z^n - 1)/n · Σ_i v_i·ω^i/(z - ω^i)`.
+fn lagrange_ext(values: &[BabyBear], z: Ext, domain: &BabyBearDomain) -> Ext {
     let n = values.len();
     let elements = domain.elements();
-    let z_n = z.pow(n as u64) - BabyBear::one();
+    let z_n = z.pow_u128(n as u128) - Ext::one();
     let n_inv = BabyBear::new(n as u64).inverse();
-    let mut sum = BabyBear::zero();
+    let mut sum = Ext::zero();
     for i in 0..n {
         let omega_i = elements[i];
-        let denom = z - omega_i;
-        sum = sum + values[i] * omega_i * denom.inverse();
+        let denom = z - Ext::from(omega_i);
+        // (values[i] * omega_i) is base; scale the Ext (z - ω^i)^-1 by it.
+        sum = sum + denom.inverse().mul_base(values[i] * omega_i);
     }
-    sum * z_n * n_inv
+    (sum * z_n).mul_base(n_inv)
 }
 
-fn derive_z_verifier(
-    transcript: &mut FiatShamirTranscript,
-    extended_domain: &BabyBearDomain,
-    shifted_domain: &BabyBearDomain,
-) -> BabyBear {
-    let ext_set: std::collections::HashSet<BabyBear> =
-        extended_domain.elements().into_iter().collect();
-    let shift_set: std::collections::HashSet<BabyBear> =
-        shifted_domain.elements().into_iter().collect();
-    let g = extended_domain.group_gen();
+/// Derive the out-of-domain point in the extension field. A non-base extension
+/// element is automatically outside the base domain (so z, g·z avoid it).
+fn derive_z_verifier(transcript: &mut FiatShamirTranscript) -> Ext {
     loop {
-        let z = transcript.squeeze_challenge();
-        if !ext_set.contains(&z)
-            && !shift_set.contains(&z)
-            && !shift_set.contains(&(g * z))
-        {
+        let z = transcript.squeeze_ext_challenge();
+        if !z.is_base() {
             return z;
         }
     }

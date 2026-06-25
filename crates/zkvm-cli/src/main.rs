@@ -96,7 +96,11 @@ fn cmd_prove(args: &[String]) {
 
     eprintln!("[cli] verifying proof...");
     let verifier = ZkvmVerifier;
-    if verifier.verify(&proof) {
+    // Pin verification to the program we actually assembled (recompute the
+    // hash from our own copy) and the entry point we intended — never trust
+    // the prover-supplied hash/entry_pc in the proof.
+    let expected_entry_pc = 0u32;
+    if verifier.verify(&proof, &program_hash, expected_entry_pc) {
         eprintln!("[cli] proof VERIFIED. trace_len={}, outputs={:?}", proof.trace_len, proof.public_outputs);
     } else {
         eprintln!("[cli] proof FAILED verification");

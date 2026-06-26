@@ -166,6 +166,14 @@ pub fn eval_transition_constraints(curr: &TraceView, next: &TraceView) -> Vec<Ex
     c.push(curr.col(col::MEM_USED) - s_load - s_store);
     c.push(curr.col(col::MEM_WR)   - s_store);
 
+    // MEM_UNUSED_ZEROED: a row with MEM_USED = 0 carries no memory tuple, so its
+    // addr/val must be 0. Without this an "unused" row can smuggle an arbitrary
+    // (addr, val) into the memory grand product, where it sorts between a real
+    // write and read and poisons the read-after-write value (forge any LOAD).
+    let mem_unused = one - curr.col(col::MEM_USED);
+    c.push(mem_unused * curr.col(col::MEM_ADDR));
+    c.push(mem_unused * curr.col(col::MEM_VAL));
+
     // JZ is-zero helper.
     let jzz = curr.col(col::JZ_IS_ZERO);
     let jzi = curr.col(col::JZ_VAL_INV);
@@ -321,6 +329,15 @@ fn mem_slot_transition(curr: &TraceView, next: &TraceView) -> Vec<Ext> {
         recon = recon + bit * Ext::from_u32(1u32 << k);
     }
     c.push(diff - recon);
+
+    // SORTED_MEM_UNUSED_ZEROED: an unused sorted entry must be (addr, val) =
+    // (0, 0). Combined with MEM_UNUSED_ZEROED on the main side and the grand
+    // product (which forces multiset equality), no unused entry can ever sit at
+    // a real address carrying an arbitrary value. This is the explicit, local
+    // form of the same invariant the grand product already implies.
+    let curr_used = curr.col(col::SMEM + 4);
+    c.push((one - curr_used) * prev_addr);
+    c.push((one - curr_used) * prev_val);
 
     c
 }
@@ -800,5 +817,37 @@ mod tests {
         cols[col::SREG_B][0] = cols[col::SREG_A][0];
         cols[col::SREG_B + 2][0] = cols[col::SREG_A + 2][0];
         assert!(any_violation(&cols, 0), "SORTED_STRICT_DIFF not enforced");
+    }
+
+    // The phantom-row memory forgery: on a MEM_USED=0 row the prover sets an
+    // arbitrary (MEM_ADDR, MEM_VAL). Pre-fix this passed every constraint and
+    // the value leaked into the sorted memory table to poison a later read.
+    #[test]
+    fn unused_row_cannot_carry_mem_addr() {
+        let (mut cols, _) = honest_columns();
+        assert!(cols[col::MEM_USED][0].is_zero(), "row 0 (IMM) should not use memory");
+        cols[col::MEM_ADDR][0] = BabyBear::from_u32(7);
+        assert!(any_violation(&cols, 0), "MEM_UNUSED_ZEROED (addr) not enforced");
+    }
+
+    #[test]
+    fn unused_row_cannot_carry_mem_val() {
+        let (mut cols, _) = honest_columns();
+        assert!(cols[col::MEM_USED][0].is_zero(), "row 0 (IMM) should not use memory");
+        cols[col::MEM_VAL][0] = BabyBear::from_u32(123);
+        assert!(any_violation(&cols, 0), "MEM_UNUSED_ZEROED (val) not enforced");
+    }
+
+    #[test]
+    fn unused_sorted_entry_must_be_zeroed() {
+        let (mut cols, _) = honest_columns();
+        // Find an unused sorted-memory row and plant a poisoning (addr, val).
+        let n = cols[0].len();
+        let row = (0..n)
+            .find(|&i| cols[col::SMEM + 4][i].is_zero())
+            .expect("an unused sorted-memory row should exist");
+        cols[col::SMEM][row] = BabyBear::from_u32(9);
+        cols[col::SMEM + 1][row] = BabyBear::from_u32(99);
+        assert!(any_violation(&cols, row), "SORTED_MEM_UNUSED_ZEROED not enforced");
     }
 }

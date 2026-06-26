@@ -207,6 +207,19 @@ The AIR enforces:
   extension-valued. This lifts the soundness of every randomized argument
   off the small base field. (Multiple γ/α channels are retained as belt-
   and-suspenders.)
+- **Low-degree test (FRI).** FRI folds the DEEP composition a *fixed* number of
+  rounds down to a degree-bound layer of size `lde/D_BOUND`, and the verifier
+  checks that final layer is a constant codeword. This is what enforces the
+  degree bound: folding to a single scalar enforces nothing. The DEEP
+  composition's degree is `< D_BOUND = COMPOSITION_DEGREE·trace_len` (max
+  constraint degree 4), tested on a `BLOWUP=16` LDE, so the rate is `1/2` and
+  `NUM_QUERIES = 132` gives `~2^-132`.
+- **Zero-knowledge.** Every witness column (trace + accumulators) is blinded as
+  `X̂ = X + Z_H·R` with `R` uniformly random: `X̂ = X` on the trace domain (so the
+  constraints and grand-product arguments are unchanged) but its openings are
+  uniform. The public, Lagrange-bound columns (program ROM + public I/O tables)
+  carry no witness and are left unblinded. Leaves are extension-valued or whole
+  rows, so they are not brute-forceable; masking alone gives the hiding.
 - **Program pinning.** `verify(proof, expected_program_hash, expected_entry_pc)`
   rejects unless the proof's program hash and entry point match what the
   caller supplies, so a passing proof certifies *your* program ran — not

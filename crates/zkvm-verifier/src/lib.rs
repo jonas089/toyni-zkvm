@@ -14,7 +14,7 @@ use toyni::babybear::BabyBear;
 use toyni::ext::Ext;
 use toyni::math::domain::BabyBearDomain;
 use toyni::math::polynomial::Polynomial;
-use toyni::merkle::verify_merkle_proof;
+use toyni::merkle::{verify_merkle_proof, MerkleTree};
 use toyni::transcript::FiatShamirTranscript;
 
 use zkvm_air::{
@@ -23,7 +23,8 @@ use zkvm_air::{
 use zkvm_core::{accum, col, NUM_ACCUM_COLS, NUM_CHANNELS, NUM_TRACE_COLS};
 
 use zkvm_prover::{
-    MerkleOpening, MerkleOpeningExt, ScalarOpening, ZkvmProof, BLOWUP, COSET_SHIFT, NUM_QUERIES,
+    fri_degree_bound, MerkleOpening, MerkleOpeningExt, ScalarOpening, ZkvmProof, BLOWUP,
+    COSET_SHIFT, NUM_QUERIES,
 };
 
 pub struct ZkvmVerifier;
@@ -102,7 +103,6 @@ impl ZkvmVerifier {
         transcript.absorb_commitment(&proof.quotient_commitment);
 
         let z = derive_z_verifier(&mut transcript);
-        let gz = z.mul_base(g);
 
         for &v in &proof.trace_at_z { transcript.absorb_ext(v); }
         for &v in &proof.trace_at_gz { transcript.absorb_ext(v); }
@@ -244,6 +244,23 @@ impl ZkvmVerifier {
 
         // ── 7. Replay FRI commitments / betas ────────────────────────
         if proof.fri_commitments.is_empty() { return false; }
+
+        // Fold-to-degree-bound + final-layer low-degree enforcement (mirrors the
+        // prover). D_BOUND bounds deg(D) of the masked DEEP composition; the
+        // committed final layer has size lde/D_BOUND and must be constant. This
+        // is the low-degree enforcement (per-query fold-consistency does not test
+        // degree).
+        let d_bound = fri_degree_bound(trace_len);
+        if d_bound == 0 || lde_size % d_bound != 0 { return false; }
+        let final_layer_size = lde_size / d_bound;
+        let expected_folds = (lde_size / final_layer_size).trailing_zeros() as usize;
+        if proof.fri_commitments.len() != expected_folds + 1 { return false; }
+        if proof.fri_final_layer.len() != final_layer_size { return false; }
+        if !proof.fri_final_layer.iter().all(|v| *v == proof.fri_final_layer[0]) { return false; }
+        if merkle_root_of_ext(&proof.fri_final_layer) != *proof.fri_commitments.last().unwrap() {
+            return false;
+        }
+
         transcript.absorb_commitment(&proof.fri_commitments[0]);
         let mut fri_betas: Vec<Ext> = Vec::new();
         for i in 1..proof.fri_commitments.len() {
@@ -263,6 +280,7 @@ impl ZkvmVerifier {
         for (qi_idx, qp) in proof.query_proofs.iter().enumerate() {
             let qi = query_indices[qi_idx];
             if qp.index != qi { return false; }
+            if qp.fri_openings.len() != expected_folds - 1 { return false; }
 
             if !verify_row_opening(&qp.trace_opening, &proof.trace_commitment, num_cols) { return false; }
             let idx_g = (qi + BLOWUP) % lde_size;
@@ -277,8 +295,10 @@ impl ZkvmVerifier {
 
             // x is base; z, g·z are extension.
             let x_i = Ext::from(shifted_elements[qi]);
+            // All DEEP quotients use denominator (x - z); the g-shifted terms
+            // open T(g·x) against T(gz), whose difference vanishes at x = z.
+            // (Must mirror the prover exactly.)
             let inv_x_z = (x_i - z).inverse();
-            let inv_x_gz = (x_i - gz).inverse();
 
             let mut expected_deep = Ext::zero();
             let mut ci = 0;
@@ -289,7 +309,7 @@ impl ZkvmVerifier {
             }
             for col_idx in 0..num_cols {
                 expected_deep = expected_deep
-                    + deep_coeffs[ci] * (Ext::from(qp.trace_opening_g.values[col_idx]) - proof.trace_at_gz[col_idx]) * inv_x_gz;
+                    + deep_coeffs[ci] * (Ext::from(qp.trace_opening_g.values[col_idx]) - proof.trace_at_gz[col_idx]) * inv_x_z;
                 ci += 1;
             }
             for col_idx in 0..num_accum_cols {
@@ -299,7 +319,7 @@ impl ZkvmVerifier {
             }
             for col_idx in 0..num_accum_cols {
                 expected_deep = expected_deep
-                    + deep_coeffs[ci] * (qp.accum_opening_g.values[col_idx] - proof.accum_at_gz[col_idx]) * inv_x_gz;
+                    + deep_coeffs[ci] * (qp.accum_opening_g.values[col_idx] - proof.accum_at_gz[col_idx]) * inv_x_z;
                 ci += 1;
             }
             expected_deep = expected_deep + deep_coeffs[ci] * (qp.quotient_opening.value - proof.q_z) * inv_x_z;
@@ -340,7 +360,10 @@ impl ZkvmVerifier {
                 pos = lo;
             }
 
-            if prev_folded != proof.fri_final_value { return false; }
+            // Folding this query position through every committed layer must
+            // land on the matching position of the (constant, commitment-bound)
+            // final layer.
+            if proof.fri_final_layer[pos] != prev_folded { return false; }
         }
 
         true
@@ -375,6 +398,14 @@ fn verify_row_opening_ext(opening: &MerkleOpeningExt, root: &[u8], num_cols: usi
 fn verify_scalar_opening(opening: &ScalarOpening, root: &[u8]) -> bool {
     let leaf = opening.value.to_bytes().to_vec();
     verify_merkle_proof(leaf, &opening.proof, &root.to_vec())
+}
+
+/// Recompute the Merkle root of an Ext-valued layer, matching the prover's
+/// `build_scalar_merkle_tree_ext` (leaf = Ext little-endian bytes).
+fn merkle_root_of_ext(values: &[Ext]) -> Vec<u8> {
+    MerkleTree::new(values.iter().map(|v| v.to_bytes().to_vec()).collect())
+        .root()
+        .unwrap()
 }
 
 /// Barycentric-style Lagrange evaluation of a base-valued table at the

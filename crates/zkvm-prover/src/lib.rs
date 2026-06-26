@@ -36,21 +36,63 @@ fn eval_ext_at_ext(coeffs: &[Ext], z: Ext) -> Ext {
     acc
 }
 
-/// FRI spot-check queries. The DEEP composition has degree < D_BOUND =
-/// COMPOSITION_DEGREE * trace_len, tested on an LDE of size BLOWUP * trace_len,
-/// so the FRI rate is COMPOSITION_DEGREE/BLOWUP = 1/2 — about one bit of
-/// soundness per query, hence 132 queries for ~2^-132.
+/// Zero-knowledge blinding of a base-field column polynomial in place:
+/// P ← P + Z_H·R with Z_H = xⁿ − 1 and R a fresh uniform degree-<MASK_DEGREE
+/// polynomial. Since Z_H·R = xⁿ·R − R, this just subtracts R into the low
+/// coefficients and adds it back shifted by n.
+fn mask_poly_base(poly: &mut Vec<BabyBear>, n: usize, rng: &mut impl rand::Rng) {
+    let r: Vec<BabyBear> = (0..MASK_DEGREE).map(|_| BabyBear::random(rng)).collect();
+    if poly.len() < n + MASK_DEGREE {
+        poly.resize(n + MASK_DEGREE, BabyBear::zero());
+    }
+    for i in 0..MASK_DEGREE {
+        poly[i] = poly[i] - r[i];
+        poly[n + i] = poly[n + i] + r[i];
+    }
+}
+
+/// Extension-field analogue of `mask_poly_base` for the accumulator columns.
+fn mask_poly_ext(poly: &mut Vec<Ext>, n: usize, rng: &mut impl rand::Rng) {
+    let r: Vec<Ext> = (0..MASK_DEGREE).map(|_| Ext::random(rng)).collect();
+    if poly.len() < n + MASK_DEGREE {
+        poly.resize(n + MASK_DEGREE, Ext::zero());
+    }
+    for i in 0..MASK_DEGREE {
+        poly[i] = poly[i] - r[i];
+        poly[n + i] = poly[n + i] + r[i];
+    }
+}
+
+/// FRI spot-check queries. The tested Reed–Solomon rate (D_BOUND/lde) is at
+/// most 1/2 for the parameters here, giving ~1 bit of soundness per query, so
+/// 132 queries → ~2^-132.
 pub const NUM_QUERIES: usize = 132;
-/// LDE blowup factor.
-pub const BLOWUP: usize = 8;
+/// LDE blowup factor. Zero-knowledge masking raises the column degree by
+/// MASK_DEGREE, which (times the constraint degree) pushes deg(D) up to ~8·n
+/// for the small test trace. Blowup 16 keeps the FRI rate ≤ 1/2; for large
+/// traces MASK_DEGREE is negligible and the rate is correspondingly better.
+pub const BLOWUP: usize = 16;
 /// Maximum total degree of any AIR constraint. The register-file grand product
 /// over 3 slots (`acc·∏₃(γ+slotᵢ)`) and the memory read-after-write check
-/// (`used·same·(1−wr)·Δval`) are both degree 4; nothing exceeds it. The DEEP
-/// composition codeword therefore has degree < COMPOSITION_DEGREE * trace_len,
-/// which sets the FRI degree bound D_BOUND and the final-layer size.
+/// (`used·same·(1−wr)·Δval`) are both degree 4; nothing exceeds it.
 pub const COMPOSITION_DEGREE: usize = 4;
+/// Random blinding coefficients added to every committed column for zero-
+/// knowledge: X̂ = X + Z_H·R with R uniformly random of this many coefficients.
+/// Z_H vanishes on the trace domain, so X̂ = X there (constraints unchanged),
+/// but off it the openings are uniform. It must cover every evaluation the
+/// verifier sees per column — 2 per query (at the queried row and its g-shift)
+/// plus the 2 out-of-domain points (z, g·z) — so 2·NUM_QUERIES + 2 suffices.
+pub const MASK_DEGREE: usize = 2 * NUM_QUERIES + 4;
 /// Coset shift used for the LDE domain.
 pub const COSET_SHIFT: u64 = 7;
+
+/// FRI degree bound D_BOUND for the masked DEEP composition: deg(D) <
+/// COMPOSITION_DEGREE·(trace_len + MASK_DEGREE) − trace_len, rounded up to a
+/// power of two. The prover folds down to a final layer of size lde/D_BOUND
+/// and the verifier checks that layer is constant.
+pub fn fri_degree_bound(trace_len: usize) -> usize {
+    (COMPOSITION_DEGREE * (trace_len + MASK_DEGREE) - trace_len).next_power_of_two()
+}
 
 // ── proof data structures ─────────────────────────────────────────────
 
@@ -179,7 +221,24 @@ impl ZkvmProver {
         // ── Phase 1: trace ───────────────────────────────────────────
         let t = std::time::Instant::now();
         eprintln!("[prove] [1/8] trace IFFT + LDE FFT ({} cols)...", num_cols);
-        let trace_polys: Vec<Vec<BabyBear>> = self.columns.iter().map(|c| domain.ifft(c)).collect();
+        let mut trace_polys: Vec<Vec<BabyBear>> = self.columns.iter().map(|c| domain.ifft(c)).collect();
+        // Zero-knowledge: blind the witness columns. X̂ = X + Z_H·R agrees with X
+        // on the trace domain (so constraints/soundness are unchanged) but off it
+        // the LDE / query / OOD openings are uniformly random. The public,
+        // Lagrange-bound columns (program ROM table + public I/O tables) carry no
+        // witness and are checked against public data at the OOD point, so they
+        // are left unblinded.
+        let mut rng = rand::thread_rng();
+        let public_cols = [
+            col::PROG, col::PROG + 1, col::PROG + 2, col::PROG + 3, col::PROG + 4, col::PROG + 6,
+            col::PUB_IN, col::PUB_IN + 1, col::PUB_IN + 2,
+            col::PUB_OUT, col::PUB_OUT + 1, col::PUB_OUT + 2,
+        ];
+        for (i, p) in trace_polys.iter_mut().enumerate() {
+            if !public_cols.contains(&i) {
+                mask_poly_base(p, trace_len, &mut rng);
+            }
+        }
         let trace_lde: Vec<Vec<BabyBear>> = trace_polys.iter().map(|c| shifted_domain.fft(c)).collect();
         eprintln!("[prove] [1/8] FFTs done in {:.2?}", t.elapsed());
         let t = std::time::Instant::now();
@@ -221,7 +280,10 @@ impl ZkvmProver {
 
         let t = std::time::Instant::now();
         eprintln!("[prove] [2/8] accum IFFT + LDE FFT ({} cols)...", NUM_ACCUM_COLS);
-        let accum_polys: Vec<Vec<Ext>> = accum_columns.iter().map(|c| domain.ifft_ext(c)).collect();
+        let mut accum_polys: Vec<Vec<Ext>> = accum_columns.iter().map(|c| domain.ifft_ext(c)).collect();
+        for p in accum_polys.iter_mut() {
+            mask_poly_ext(p, trace_len, &mut rng);
+        }
         let accum_lde: Vec<Vec<Ext>> = accum_polys.iter().map(|c| shifted_domain.fft_ext(c)).collect();
         eprintln!("[prove] [2/8] accum FFTs done in {:.2?}", t.elapsed());
         let t = std::time::Instant::now();
@@ -485,7 +547,7 @@ impl ZkvmProver {
         // verifier checks that constancy, which is what enforces the low-degree
         // bound. The round count is data-independent (no early "constant yet?"
         // break), so a malicious prover cannot stop early.
-        let final_layer_size = lde_size / (COMPOSITION_DEGREE * trace_len);
+        let final_layer_size = lde_size / fri_degree_bound(trace_len);
         while current.len() > final_layer_size {
             let beta = transcript.squeeze_ext_challenge();
             let folded = fri_fold_ext(&current, &xs, beta);

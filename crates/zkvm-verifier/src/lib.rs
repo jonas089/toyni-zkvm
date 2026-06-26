@@ -23,7 +23,7 @@ use zkvm_air::{
 use zkvm_core::{accum, col, NUM_ACCUM_COLS, NUM_CHANNELS, NUM_TRACE_COLS};
 
 use zkvm_prover::{
-    MerkleOpening, MerkleOpeningExt, ScalarOpening, ZkvmProof, BLOWUP, COMPOSITION_DEGREE,
+    fri_degree_bound, MerkleOpening, MerkleOpeningExt, ScalarOpening, ZkvmProof, BLOWUP,
     COSET_SHIFT, NUM_QUERIES,
 };
 
@@ -246,12 +246,12 @@ impl ZkvmVerifier {
         if proof.fri_commitments.is_empty() { return false; }
 
         // Fold-to-degree-bound + final-layer low-degree enforcement (mirrors the
-        // prover). D_BOUND = COMPOSITION_DEGREE * trace_len bounds deg(D); the
+        // prover). D_BOUND bounds deg(D) of the masked DEEP composition; the
         // committed final layer has size lde/D_BOUND and must be constant. This
         // is the low-degree enforcement (per-query fold-consistency does not test
         // degree).
-        let d_bound = COMPOSITION_DEGREE * trace_len;
-        if d_bound == 0 || lde_size % d_bound != 0 { eprintln!("DBG: d_bound div"); return false; }
+        let d_bound = fri_degree_bound(trace_len);
+        if d_bound == 0 || lde_size % d_bound != 0 { return false; }
         let final_layer_size = lde_size / d_bound;
         let expected_folds = (lde_size / final_layer_size).trailing_zeros() as usize;
         if proof.fri_commitments.len() != expected_folds + 1 { return false; }

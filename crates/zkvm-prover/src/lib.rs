@@ -36,8 +36,20 @@ fn eval_ext_at_ext(coeffs: &[Ext], z: Ext) -> Ext {
     acc
 }
 
-pub const NUM_QUERIES: usize = 44;
+/// FRI spot-check queries. The DEEP composition has degree < D_BOUND =
+/// COMPOSITION_DEGREE * trace_len, tested on an LDE of size BLOWUP * trace_len,
+/// so the FRI rate is COMPOSITION_DEGREE/BLOWUP = 1/2 — about one bit of
+/// soundness per query, hence 132 queries for ~2^-132.
+pub const NUM_QUERIES: usize = 132;
+/// LDE blowup factor.
 pub const BLOWUP: usize = 8;
+/// Maximum total degree of any AIR constraint. The register-file grand product
+/// over 3 slots (`acc·∏₃(γ+slotᵢ)`) and the memory read-after-write check
+/// (`used·same·(1−wr)·Δval`) are both degree 4; nothing exceeds it. The DEEP
+/// composition codeword therefore has degree < COMPOSITION_DEGREE * trace_len,
+/// which sets the FRI degree bound D_BOUND and the final-layer size.
+pub const COMPOSITION_DEGREE: usize = 4;
+/// Coset shift used for the LDE domain.
 pub const COSET_SHIFT: u64 = 7;
 
 // ── proof data structures ─────────────────────────────────────────────
@@ -100,7 +112,10 @@ pub struct ZkvmProof {
     pub alphas: [Ext; 4],
 
     pub fri_commitments: Vec<Vec<u8>>,
-    pub fri_final_value: Ext,
+    /// Full final FRI layer (size lde/D_BOUND), sent in clear. The verifier
+    /// checks it is constant — the low-degree enforcement that per-query
+    /// fold-consistency does not provide on its own.
+    pub fri_final_layer: Vec<Ext>,
     pub query_proofs: Vec<QueryProof>,
 
     pub program_hash: [u8; 32],
@@ -418,8 +433,11 @@ impl ZkvmProver {
             // x is base; the OOD points z, g·z are extension, so the
             // denominators (x - z) etc. are extension elements.
             let x = Ext::from(shifted_elements[i]);
+            // All DEEP quotients use denominator (x - z). The g-shifted terms
+            // open the shifted trace value T(g·x) against the OOD value T(gz):
+            // T(g·x) - T(gz) vanishes at x = z (since T(g·z) = T(gz)), so the
+            // quotient is a genuine low-degree polynomial.
             let inv_x_z = (x - z).inverse();
-            let inv_x_gz = (x - gz).inverse();
 
             let mut d = Ext::zero();
             let mut ci = 0;
@@ -429,7 +447,7 @@ impl ZkvmProver {
             }
             let next_i = (i + BLOWUP) % lde_size;
             for col_idx in 0..num_cols {
-                d = d + deep_coeffs[ci] * (Ext::from(trace_lde[col_idx][next_i]) - trace_at_gz[col_idx]) * inv_x_gz;
+                d = d + deep_coeffs[ci] * (Ext::from(trace_lde[col_idx][next_i]) - trace_at_gz[col_idx]) * inv_x_z;
                 ci += 1;
             }
             for col_idx in 0..NUM_ACCUM_COLS {
@@ -437,7 +455,7 @@ impl ZkvmProver {
                 ci += 1;
             }
             for col_idx in 0..NUM_ACCUM_COLS {
-                d = d + deep_coeffs[ci] * (accum_lde[col_idx][next_i] - accum_at_gz[col_idx]) * inv_x_gz;
+                d = d + deep_coeffs[ci] * (accum_lde[col_idx][next_i] - accum_at_gz[col_idx]) * inv_x_z;
                 ci += 1;
             }
             d = d + deep_coeffs[ci] * (q_evals[i] - q_z) * inv_x_z;
@@ -461,13 +479,18 @@ impl ZkvmProver {
 
         let mut current = d_evals;
         let mut xs: Vec<BabyBear> = shifted_elements.clone();
-        loop {
-            if current.len() <= 1 { break; }
+        // Fold a FIXED number of rounds down to the degree-bound layer of size
+        // lde_size / D_BOUND, where D_BOUND = COMPOSITION_DEGREE * trace_len
+        // bounds deg(D). For an honest proof that final layer is constant; the
+        // verifier checks that constancy, which is what enforces the low-degree
+        // bound. The round count is data-independent (no early "constant yet?"
+        // break), so a malicious prover cannot stop early.
+        let final_layer_size = lde_size / (COMPOSITION_DEGREE * trace_len);
+        while current.len() > final_layer_size {
             let beta = transcript.squeeze_ext_challenge();
             let folded = fri_fold_ext(&current, &xs, beta);
             xs.truncate(folded.len());
             for x in &mut xs { *x = *x * *x; }
-            let is_constant = folded.iter().all(|v| *v == folded[0]);
             fri_layers.push(folded.clone());
             let tree = build_scalar_merkle_tree_ext(&folded);
             let root = tree.root().unwrap();
@@ -475,9 +498,8 @@ impl ZkvmProver {
             fri_commitments.push(root);
             fri_trees.push(tree);
             current = folded;
-            if is_constant { break; }
         }
-        let fri_final_value = current[0];
+        let fri_final_layer = current;
         eprintln!(
             "[prove] [7/8] done in {:.2?} ({} layers)",
             t.elapsed(),
@@ -532,7 +554,7 @@ impl ZkvmProver {
             trace_commitment, accum_commitment, quotient_commitment,
             trace_at_z, trace_at_gz, accum_at_z, accum_at_gz, q_z,
             gammas, alphas,
-            fri_commitments, fri_final_value, query_proofs,
+            fri_commitments, fri_final_layer, query_proofs,
             program_hash: self.program_hash,
             public_inputs: self.public_inputs.clone(),
             public_outputs: self.public_outputs.clone(),

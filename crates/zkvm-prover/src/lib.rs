@@ -36,10 +36,8 @@ fn eval_ext_at_ext(coeffs: &[Ext], z: Ext) -> Ext {
     acc
 }
 
-/// Zero-knowledge blinding of a base-field column polynomial in place:
-/// P ← P + Z_H·R with Z_H = xⁿ − 1 and R a fresh uniform degree-<MASK_DEGREE
-/// polynomial. Since Z_H·R = xⁿ·R − R, this just subtracts R into the low
-/// coefficients and adds it back shifted by n.
+/// Blind a base-field column in place: P += Z_H * R with fresh random R.
+/// Z_H = x^n - 1, so Z_H*R = x^n*R - R (subtract R low, add it back shifted n).
 fn mask_poly_base(poly: &mut Vec<BabyBear>, n: usize, rng: &mut impl rand::Rng) {
     let r: Vec<BabyBear> = (0..MASK_DEGREE).map(|_| BabyBear::random(rng)).collect();
     if poly.len() < n + MASK_DEGREE {
@@ -63,33 +61,23 @@ fn mask_poly_ext(poly: &mut Vec<Ext>, n: usize, rng: &mut impl rand::Rng) {
     }
 }
 
-/// FRI spot-check queries. The tested Reed–Solomon rate (D_BOUND/lde) is at
-/// most 1/2 for the parameters here, giving ~1 bit of soundness per query, so
-/// 132 queries → ~2^-132.
+/// Spot-check queries. The tested RS rate is at most 1/2 (~1 bit each), so 132
+/// queries give ~2^-132.
 pub const NUM_QUERIES: usize = 132;
-/// LDE blowup factor. Zero-knowledge masking raises the column degree by
-/// MASK_DEGREE, which (times the constraint degree) pushes deg(D) up to ~8·n
-/// for the small test trace. Blowup 16 keeps the FRI rate ≤ 1/2; for large
-/// traces MASK_DEGREE is negligible and the rate is correspondingly better.
+/// LDE blowup. Masking pushes deg(D) up to ~8*n on the small test trace, so
+/// blowup 16 keeps the FRI rate <= 1/2 (better on large traces).
 pub const BLOWUP: usize = 16;
-/// Maximum total degree of any AIR constraint. The register-file grand product
-/// over 3 slots (`acc·∏₃(γ+slotᵢ)`) and the memory read-after-write check
-/// (`used·same·(1−wr)·Δval`) are both degree 4; nothing exceeds it.
+/// Max total degree of any AIR constraint: the register grand product (acc
+/// times 3 slot factors) and the memory read-after-write check are degree 4.
 pub const COMPOSITION_DEGREE: usize = 4;
-/// Random blinding coefficients added to every committed column for zero-
-/// knowledge: X̂ = X + Z_H·R with R uniformly random of this many coefficients.
-/// Z_H vanishes on the trace domain, so X̂ = X there (constraints unchanged),
-/// but off it the openings are uniform. It must cover every evaluation the
-/// verifier sees per column — 2 per query (at the queried row and its g-shift)
-/// plus the 2 out-of-domain points (z, g·z) — so 2·NUM_QUERIES + 2 suffices.
+/// Random blinding coefficients per committed column (X_hat = X + Z_H * R).
+/// Covers every revealed evaluation: 2 openings per query + 2 OOD points.
 pub const MASK_DEGREE: usize = 2 * NUM_QUERIES + 4;
 /// Coset shift used for the LDE domain.
 pub const COSET_SHIFT: u64 = 7;
 
-/// FRI degree bound D_BOUND for the masked DEEP composition: deg(D) <
-/// COMPOSITION_DEGREE·(trace_len + MASK_DEGREE) − trace_len, rounded up to a
-/// power of two. The prover folds down to a final layer of size lde/D_BOUND
-/// and the verifier checks that layer is constant.
+/// FRI degree bound: smallest power of two above deg(D) of the masked DEEP
+/// composition. The prover folds to a final layer of size lde/D_BOUND.
 pub fn fri_degree_bound(trace_len: usize) -> usize {
     (COMPOSITION_DEGREE * (trace_len + MASK_DEGREE) - trace_len).next_power_of_two()
 }
@@ -154,9 +142,8 @@ pub struct ZkvmProof {
     pub alphas: [Ext; 4],
 
     pub fri_commitments: Vec<Vec<u8>>,
-    /// Full final FRI layer (size lde/D_BOUND), sent in clear. The verifier
-    /// checks it is constant — the low-degree enforcement that per-query
-    /// fold-consistency does not provide on its own.
+    /// Full final FRI layer (size lde/D_BOUND), sent in clear; the verifier
+    /// checks it is constant. This is what enforces the low-degree bound.
     pub fri_final_layer: Vec<Ext>,
     pub query_proofs: Vec<QueryProof>,
 
@@ -222,12 +209,10 @@ impl ZkvmProver {
         let t = std::time::Instant::now();
         eprintln!("[prove] [1/8] trace IFFT + LDE FFT ({} cols)...", num_cols);
         let mut trace_polys: Vec<Vec<BabyBear>> = self.columns.iter().map(|c| domain.ifft(c)).collect();
-        // Zero-knowledge: blind the witness columns. X̂ = X + Z_H·R agrees with X
-        // on the trace domain (so constraints/soundness are unchanged) but off it
-        // the LDE / query / OOD openings are uniformly random. The public,
-        // Lagrange-bound columns (program ROM table + public I/O tables) carry no
-        // witness and are checked against public data at the OOD point, so they
-        // are left unblinded.
+        // Blind the witness columns for zero-knowledge (X_hat = X + Z_H * R,
+        // equal to X on the trace domain). The public, Lagrange-bound columns
+        // (program ROM + public I/O tables) carry no witness and are checked
+        // against public data at the OOD point, so they are left unblinded.
         let mut rng = rand::thread_rng();
         let public_cols = [
             col::PROG, col::PROG + 1, col::PROG + 2, col::PROG + 3, col::PROG + 4, col::PROG + 6,
@@ -495,10 +480,8 @@ impl ZkvmProver {
             // x is base; the OOD points z, g·z are extension, so the
             // denominators (x - z) etc. are extension elements.
             let x = Ext::from(shifted_elements[i]);
-            // All DEEP quotients use denominator (x - z). The g-shifted terms
-            // open the shifted trace value T(g·x) against the OOD value T(gz):
-            // T(g·x) - T(gz) vanishes at x = z (since T(g·z) = T(gz)), so the
-            // quotient is a genuine low-degree polynomial.
+            // All DEEP quotients use denominator (x - z); for the g-shifted
+            // terms, T(g*x) - T(gz) vanishes at x = z, so they stay low-degree.
             let inv_x_z = (x - z).inverse();
 
             let mut d = Ext::zero();
@@ -541,12 +524,9 @@ impl ZkvmProver {
 
         let mut current = d_evals;
         let mut xs: Vec<BabyBear> = shifted_elements.clone();
-        // Fold a FIXED number of rounds down to the degree-bound layer of size
-        // lde_size / D_BOUND, where D_BOUND = COMPOSITION_DEGREE * trace_len
-        // bounds deg(D). For an honest proof that final layer is constant; the
-        // verifier checks that constancy, which is what enforces the low-degree
-        // bound. The round count is data-independent (no early "constant yet?"
-        // break), so a malicious prover cannot stop early.
+        // Fold down to the degree-bound layer (size lde/D_BOUND). For an honest
+        // proof that layer is constant; the verifier checks that, which enforces
+        // the degree bound. The round count is fixed, not data-dependent.
         let final_layer_size = lde_size / fri_degree_bound(trace_len);
         while current.len() > final_layer_size {
             let beta = transcript.squeeze_ext_challenge();

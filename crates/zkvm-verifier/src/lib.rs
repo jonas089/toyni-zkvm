@@ -245,11 +245,8 @@ impl ZkvmVerifier {
         // ── 7. Replay FRI commitments / betas ────────────────────────
         if proof.fri_commitments.is_empty() { return false; }
 
-        // Fold-to-degree-bound + final-layer low-degree enforcement (mirrors the
-        // prover). D_BOUND bounds deg(D) of the masked DEEP composition; the
-        // committed final layer has size lde/D_BOUND and must be constant. This
-        // is the low-degree enforcement (per-query fold-consistency does not test
-        // degree).
+        // Require the final layer (size lde/D_BOUND) to be constant. This is the
+        // low-degree enforcement; fold-consistency alone does not test degree.
         let d_bound = fri_degree_bound(trace_len);
         if d_bound == 0 || lde_size % d_bound != 0 { return false; }
         let final_layer_size = lde_size / d_bound;
@@ -295,9 +292,7 @@ impl ZkvmVerifier {
 
             // x is base; z, g·z are extension.
             let x_i = Ext::from(shifted_elements[qi]);
-            // All DEEP quotients use denominator (x - z); the g-shifted terms
-            // open T(g·x) against T(gz), whose difference vanishes at x = z.
-            // (Must mirror the prover exactly.)
+            // All DEEP quotients use denominator (x - z), mirroring the prover.
             let inv_x_z = (x_i - z).inverse();
 
             let mut expected_deep = Ext::zero();

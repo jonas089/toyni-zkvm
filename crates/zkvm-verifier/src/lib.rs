@@ -131,7 +131,7 @@ impl ZkvmVerifier {
         for (j, &v) in accum_cv.iter().enumerate() {
             c_wrap = c_wrap + cweights[num_main + j] * v;
         }
-        let z_at_z = eval_base_at_ext(z_poly.coefficients(), z);
+        let z_at_z = z.eval_base_at_ext(z_poly.coefficients());
         let transition_q_z = (c_excepted * (z - omega_nm1) + c_wrap) * z_at_z.inverse();
 
         let alpha_b = total_constraints;
@@ -363,15 +363,6 @@ impl ZkvmVerifier {
 
         true
     }
-}
-
-/// Evaluate a base-field-coefficient polynomial at an extension point.
-fn eval_base_at_ext(coeffs: &[BabyBear], z: Ext) -> Ext {
-    let mut acc = Ext::zero();
-    for &c in coeffs.iter().rev() {
-        acc = acc * z + Ext::from(c);
-    }
-    acc
 }
 
 fn verify_row_opening(opening: &MerkleOpening, root: &[u8], num_cols: usize) -> bool {

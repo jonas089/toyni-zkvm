@@ -9,6 +9,7 @@ use toyni::babybear::BabyBear;
 use toyni::ext::Ext;
 use toyni::math::domain::BabyBearDomain;
 use toyni::math::fri::fri_fold_ext;
+use toyni::math::mask::{mask_poly_base, mask_poly_ext};
 use toyni::math::polynomial::Polynomial;
 use toyni::merkle::{MerkleProof, MerkleTree};
 use toyni::transcript::FiatShamirTranscript;
@@ -17,49 +18,6 @@ use zkvm_air::{
     eval_transition_constraints, num_transition_constraints, permutation, TraceView,
 };
 use zkvm_core::{accum, col, NUM_ACCUM_COLS, NUM_CHANNELS, NUM_TRACE_COLS};
-
-/// Evaluate a base-field-coefficient polynomial at an extension point.
-fn eval_base_at_ext(coeffs: &[BabyBear], z: Ext) -> Ext {
-    let mut acc = Ext::zero();
-    for &c in coeffs.iter().rev() {
-        acc = acc * z + Ext::from(c);
-    }
-    acc
-}
-
-/// Evaluate an extension-field-coefficient polynomial at an extension point.
-fn eval_ext_at_ext(coeffs: &[Ext], z: Ext) -> Ext {
-    let mut acc = Ext::zero();
-    for &c in coeffs.iter().rev() {
-        acc = acc * z + c;
-    }
-    acc
-}
-
-/// Blind a base-field column in place: P += Z_H * R with fresh random R.
-/// Z_H = x^n - 1, so Z_H*R = x^n*R - R (subtract R low, add it back shifted n).
-fn mask_poly_base(poly: &mut Vec<BabyBear>, n: usize, rng: &mut impl rand::Rng) {
-    let r: Vec<BabyBear> = (0..MASK_DEGREE).map(|_| BabyBear::random(rng)).collect();
-    if poly.len() < n + MASK_DEGREE {
-        poly.resize(n + MASK_DEGREE, BabyBear::zero());
-    }
-    for i in 0..MASK_DEGREE {
-        poly[i] = poly[i] - r[i];
-        poly[n + i] = poly[n + i] + r[i];
-    }
-}
-
-/// Extension-field analogue of `mask_poly_base` for the accumulator columns.
-fn mask_poly_ext(poly: &mut Vec<Ext>, n: usize, rng: &mut impl rand::Rng) {
-    let r: Vec<Ext> = (0..MASK_DEGREE).map(|_| Ext::random(rng)).collect();
-    if poly.len() < n + MASK_DEGREE {
-        poly.resize(n + MASK_DEGREE, Ext::zero());
-    }
-    for i in 0..MASK_DEGREE {
-        poly[i] = poly[i] - r[i];
-        poly[n + i] = poly[n + i] + r[i];
-    }
-}
 
 /// Spot-check queries. The tested RS rate is at most 1/2 (~1 bit each), so 132
 /// queries give ~2^-132.
@@ -221,7 +179,7 @@ impl ZkvmProver {
         ];
         for (i, p) in trace_polys.iter_mut().enumerate() {
             if !public_cols.contains(&i) {
-                mask_poly_base(p, trace_len, &mut rng);
+                mask_poly_base(p, trace_len, MASK_DEGREE, &mut rng);
             }
         }
         let trace_lde: Vec<Vec<BabyBear>> = trace_polys.iter().map(|c| shifted_domain.fft(c)).collect();
@@ -267,7 +225,7 @@ impl ZkvmProver {
         eprintln!("[prove] [2/8] accum IFFT + LDE FFT ({} cols)...", NUM_ACCUM_COLS);
         let mut accum_polys: Vec<Vec<Ext>> = accum_columns.iter().map(|c| domain.ifft_ext(c)).collect();
         for p in accum_polys.iter_mut() {
-            mask_poly_ext(p, trace_len, &mut rng);
+            mask_poly_ext(p, trace_len, MASK_DEGREE, &mut rng);
         }
         let accum_lde: Vec<Vec<Ext>> = accum_polys.iter().map(|c| shifted_domain.fft_ext(c)).collect();
         eprintln!("[prove] [2/8] accum FFTs done in {:.2?}", t.elapsed());
@@ -391,16 +349,16 @@ impl ZkvmProver {
         // ── Phase 5: OOD ─────────────────────────────────────────────
         let t = std::time::Instant::now();
         eprintln!("[prove] [5/8] OOD evaluation...");
-        let z = derive_z(&mut transcript, &extended_domain, &shifted_domain);
+        let z = derive_z(&mut transcript);
         let gz = z.mul_base(g);
 
-        let trace_at_z: Vec<Ext> = trace_polys.iter().map(|c| eval_base_at_ext(c, z)).collect();
-        let trace_at_gz: Vec<Ext> = trace_polys.iter().map(|c| eval_base_at_ext(c, gz)).collect();
-        let accum_at_z: Vec<Ext> = accum_polys.iter().map(|c| eval_ext_at_ext(c, z)).collect();
-        let accum_at_gz: Vec<Ext> = accum_polys.iter().map(|c| eval_ext_at_ext(c, gz)).collect();
+        let trace_at_z: Vec<Ext> = trace_polys.iter().map(|c| z.eval_base_at_ext(c)).collect();
+        let trace_at_gz: Vec<Ext> = trace_polys.iter().map(|c| gz.eval_base_at_ext(c)).collect();
+        let accum_at_z: Vec<Ext> = accum_polys.iter().map(|c| z.eval_ext_at_ext(c)).collect();
+        let accum_at_gz: Vec<Ext> = accum_polys.iter().map(|c| gz.eval_ext_at_ext(c)).collect();
 
         let q_coeffs = shifted_domain.ifft_ext(&q_evals);
-        let q_z = eval_ext_at_ext(&q_coeffs, z);
+        let q_z = z.eval_ext_at_ext(&q_coeffs);
 
         // Reconstruct q(z) and verify it matches.
         let curr_z = TraceView { vals: trace_at_z.clone() };
@@ -418,7 +376,7 @@ impl ZkvmProver {
             c_wrap_z = c_wrap_z + cweights[num_main + j] * v;
         }
         let omega_nm1_e = Ext::from(omega_n_minus_1);
-        let z_at_z = eval_base_at_ext(z_poly.coefficients(), z);
+        let z_at_z = z.eval_base_at_ext(z_poly.coefficients());
         let transition_q_z = (c_excepted_z * (z - omega_nm1_e) + c_wrap_z) * z_at_z.inverse();
 
         let one = Ext::one();
@@ -665,8 +623,6 @@ fn open_scalar_merkle_ext(tree: &MerkleTree, evals: &[Ext], index: usize) -> Sca
 /// z, g·z ∉ domain (keeping the DEEP denominators invertible).
 fn derive_z(
     transcript: &mut FiatShamirTranscript,
-    _extended_domain: &BabyBearDomain,
-    _shifted_domain: &BabyBearDomain,
 ) -> Ext {
     loop {
         let z = transcript.squeeze_ext_challenge();

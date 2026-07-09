@@ -155,6 +155,7 @@ dependencies = [
 [[package]]
 name = "toyni"
 version = "0.1.0"
+source = "git+https://github.com/jonas089/toyni#5836942eab7025a4b34812977b1990ec5539135a"
 dependencies = [
  "rand",
  "sha2",

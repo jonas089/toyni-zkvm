@@ -11,7 +11,18 @@ proving backend.
 
 ## Status
 
-- **Toyni (proving backend)**: solid. Core STARK toolkit + CUDA NTT path.
+- **Toyni (proving backend)**: now a **dual-engine** STARK library — the
+  classical roots-of-unity STARK over BabyBear *and* a circle STARK over
+  Mersenne-31, behind one generic `Air`/`Engine` architecture (see the
+  toyni README). This zkVM builds on the local merged toyni and its full
+  LogUp/grand-product VM proves and verifies on the **roots-of-unity
+  engine**. Because the engine geometry is now abstracted, a circle-engine
+  VM is a change of the geometry layer (out-of-domain point, single-point
+  quotient denominators, FRI fold, extension-column FFT) rather than a
+  rewrite; the main protocol adaptation it needs is moving the single-row
+  transition exclusion to the circle-friendly two-row form. That port is
+  tracked, not yet landed.
+- **Toyni (legacy note)**: solid core STARK toolkit + CUDA NTT path.
 - **zkvm (this repo)**: the AIR aims to be a *fully constrained* minimal
   VM — every trace column is fixed by a transition/boundary constraint or
   bound by a permutation/lookup argument, leaving the prover no

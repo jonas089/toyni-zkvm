@@ -5,14 +5,18 @@
 //! DEEP composition + FRI + queries.
 
 use sha2::{Digest, Sha256};
-use toyni::babybear::BabyBear;
-use toyni::ext::Ext;
-use toyni::math::domain::BabyBearDomain;
-use toyni::math::fri::fri_fold_ext;
-use toyni::math::mask::{mask_poly_base, mask_poly_ext};
-use toyni::math::polynomial::Polynomial;
-use toyni::merkle::{MerkleProof, MerkleTree};
-use toyni::transcript::FiatShamirTranscript;
+use toyni::field::BabyBear;
+use toyni::field::BabyBearExt as Ext;
+use toyni::engine::classical::domain::BabyBearDomain;
+use toyni::engine::classical::fri_fold::fri_fold_ext;
+use toyni::mask::{mask_poly_base, mask_poly_ext};
+use toyni::polynomial::Polynomial;
+use toyni::merkle::{Hash, MerkleTree};
+use toyni::{ClassicalEngine, Engine};
+use toyni::transcript::Transcript;
+
+/// Draw a BabyBear quartic-extension Fiat-Shamir challenge.
+fn draw_ext(t: &mut Transcript) -> Ext { ClassicalEngine::draw_ext(t) }
 
 use zkvm_air::{
     eval_transition_constraints, num_transition_constraints, permutation, TraceView,
@@ -47,7 +51,7 @@ pub fn fri_degree_bound(trace_len: usize) -> usize {
 pub struct MerkleOpening {
     pub index: usize,
     pub values: Vec<BabyBear>,
-    pub proof: MerkleProof,
+    pub path: Vec<Hash>,
 }
 
 /// Opening of an extension-field committed row (the accumulators).
@@ -55,7 +59,7 @@ pub struct MerkleOpening {
 pub struct MerkleOpeningExt {
     pub index: usize,
     pub values: Vec<Ext>,
-    pub proof: MerkleProof,
+    pub path: Vec<Hash>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,7 +80,7 @@ pub struct QueryProof {
 pub struct ScalarOpening {
     pub index: usize,
     pub value: Ext,
-    pub proof: MerkleProof,
+    pub path: Vec<Hash>,
 }
 
 #[derive(Debug)]
@@ -86,9 +90,9 @@ pub struct ZkvmProof {
     pub num_cols: usize,
     pub num_accum_cols: usize,
 
-    pub trace_commitment: Vec<u8>,
-    pub accum_commitment: Vec<u8>,
-    pub quotient_commitment: Vec<u8>,
+    pub trace_commitment: Hash,
+    pub accum_commitment: Hash,
+    pub quotient_commitment: Hash,
 
     pub trace_at_z: Vec<Ext>,
     pub trace_at_gz: Vec<Ext>,
@@ -99,7 +103,7 @@ pub struct ZkvmProof {
     pub gammas: [Ext; 4],
     pub alphas: [Ext; 4],
 
-    pub fri_commitments: Vec<Vec<u8>>,
+    pub fri_commitments: Vec<Hash>,
     /// Full final FRI layer (size lde/D_BOUND), sent in clear; the verifier
     /// checks it is constant. This is what enforces the low-degree bound.
     pub fri_final_layer: Vec<Ext>,
@@ -186,10 +190,10 @@ impl ZkvmProver {
         eprintln!("[prove] [1/8] FFTs done in {:.2?}", t.elapsed());
         let t = std::time::Instant::now();
         let trace_tree = build_row_merkle_tree(&trace_lde, lde_size);
-        let trace_commitment = trace_tree.root().unwrap();
+        let trace_commitment = trace_tree.root();
         eprintln!("[prove] [1/8] trace merkle done in {:.2?}", t.elapsed());
 
-        let mut transcript = FiatShamirTranscript::new();
+        let mut transcript = Transcript::new(b"zkvm");
         transcript.absorb_commitment(&self.program_hash);
         transcript.absorb_field(BabyBear::from_u32(self.entry_pc));
         for &v in &self.public_inputs { transcript.absorb_field(BabyBear::from_u32(v)); }
@@ -202,12 +206,12 @@ impl ZkvmProver {
         // Lookup / permutation challenges are drawn from the extension field
         // for ~124-bit soundness.
         let gammas: [Ext; 4] = [
-            transcript.squeeze_ext_challenge(), transcript.squeeze_ext_challenge(),
-            transcript.squeeze_ext_challenge(), transcript.squeeze_ext_challenge(),
+            draw_ext(&mut transcript), draw_ext(&mut transcript),
+            draw_ext(&mut transcript), draw_ext(&mut transcript),
         ];
         let alphas: [Ext; 4] = [
-            transcript.squeeze_ext_challenge(), transcript.squeeze_ext_challenge(),
-            transcript.squeeze_ext_challenge(), transcript.squeeze_ext_challenge(),
+            draw_ext(&mut transcript), draw_ext(&mut transcript),
+            draw_ext(&mut transcript), draw_ext(&mut transcript),
         ];
 
         let t = std::time::Instant::now();
@@ -231,7 +235,7 @@ impl ZkvmProver {
         eprintln!("[prove] [2/8] accum FFTs done in {:.2?}", t.elapsed());
         let t = std::time::Instant::now();
         let accum_tree = build_row_merkle_tree_ext(&accum_lde, lde_size);
-        let accum_commitment = accum_tree.root().unwrap();
+        let accum_commitment = accum_tree.root();
         eprintln!("[prove] [2/8] accum merkle done in {:.2?}", t.elapsed());
         transcript.absorb_commitment(&accum_commitment);
 
@@ -254,7 +258,7 @@ impl ZkvmProver {
         let omega_0 = BabyBear::one();
 
         let cweights: Vec<Ext> = (0..total_with_boundary)
-            .map(|_| transcript.squeeze_ext_challenge())
+            .map(|_| draw_ext(&mut transcript))
             .collect();
 
         let t = std::time::Instant::now();
@@ -342,7 +346,7 @@ impl ZkvmProver {
         let t = std::time::Instant::now();
         eprintln!("[prove] [4/8] quotient merkle...");
         let q_tree = build_scalar_merkle_tree_ext(&q_evals);
-        let quotient_commitment = q_tree.root().unwrap();
+        let quotient_commitment = q_tree.root();
         eprintln!("[prove] [4/8] done in {:.2?}", t.elapsed());
         transcript.absorb_commitment(&quotient_commitment);
 
@@ -408,16 +412,16 @@ impl ZkvmProver {
         assert_eq!(computed_q_z, q_z, "OOD constraint check failed");
         eprintln!("[prove] [5/8] done in {:.2?}", t.elapsed());
 
-        for &v in &trace_at_z { transcript.absorb_ext(v); }
-        for &v in &trace_at_gz { transcript.absorb_ext(v); }
-        for &v in &accum_at_z { transcript.absorb_ext(v); }
-        for &v in &accum_at_gz { transcript.absorb_ext(v); }
-        transcript.absorb_ext(q_z);
+        for &v in &trace_at_z { transcript.absorb_field(v); }
+        for &v in &trace_at_gz { transcript.absorb_field(v); }
+        for &v in &accum_at_z { transcript.absorb_field(v); }
+        for &v in &accum_at_gz { transcript.absorb_field(v); }
+        transcript.absorb_field(q_z);
 
         // ── Phase 6: DEEP ────────────────────────────────────────────
         let num_deep_terms = 2 * num_cols + 2 * NUM_ACCUM_COLS + 1;
         let deep_coeffs: Vec<Ext> = (0..num_deep_terms)
-            .map(|_| transcript.squeeze_ext_challenge())
+            .map(|_| draw_ext(&mut transcript))
             .collect();
 
         let t = std::time::Instant::now();
@@ -471,11 +475,11 @@ impl ZkvmProver {
         eprintln!("[prove] [7/8] FRI commit + folding...");
         let mut fri_layers: Vec<Vec<Ext>> = Vec::new();
         let mut fri_trees: Vec<MerkleTree> = Vec::new();
-        let mut fri_commitments: Vec<Vec<u8>> = Vec::new();
+        let mut fri_commitments: Vec<Hash> = Vec::new();
 
         fri_layers.push(d_evals.clone());
         let tree0 = build_scalar_merkle_tree_ext(&d_evals);
-        let root0 = tree0.root().unwrap();
+        let root0 = tree0.root();
         transcript.absorb_commitment(&root0);
         fri_commitments.push(root0);
         fri_trees.push(tree0);
@@ -487,13 +491,13 @@ impl ZkvmProver {
         // the degree bound. The round count is fixed, not data-dependent.
         let final_layer_size = lde_size / fri_degree_bound(trace_len);
         while current.len() > final_layer_size {
-            let beta = transcript.squeeze_ext_challenge();
+            let beta = draw_ext(&mut transcript);
             let folded = fri_fold_ext(&current, &xs, beta);
             xs.truncate(folded.len());
             for x in &mut xs { *x = *x * *x; }
             fri_layers.push(folded.clone());
             let tree = build_scalar_merkle_tree_ext(&folded);
-            let root = tree.root().unwrap();
+            let root = tree.root();
             transcript.absorb_commitment(&root);
             fri_commitments.push(root);
             fri_trees.push(tree);
@@ -510,7 +514,7 @@ impl ZkvmProver {
         let t = std::time::Instant::now();
         eprintln!("[prove] [8/8] building {} query proofs...", NUM_QUERIES);
         let first_layer_half = fri_layers[0].len() / 2;
-        let query_indices = transcript.squeeze_indices(NUM_QUERIES, first_layer_half);
+        let query_indices = transcript.draw_indices(NUM_QUERIES, first_layer_half);
 
         let mut query_proofs = Vec::with_capacity(NUM_QUERIES);
         for &qi in &query_indices {
@@ -581,7 +585,7 @@ fn build_row_merkle_tree(cols: &[Vec<BabyBear>], lde_size: usize) -> MerkleTree 
         }
         h.finalize().to_vec()
     }).collect();
-    MerkleTree::new(leaves)
+    MerkleTree::new(&leaves)
 }
 
 fn build_row_merkle_tree_ext(cols: &[Vec<Ext>], lde_size: usize) -> MerkleTree {
@@ -593,39 +597,38 @@ fn build_row_merkle_tree_ext(cols: &[Vec<Ext>], lde_size: usize) -> MerkleTree {
         }
         h.finalize().to_vec()
     }).collect();
-    MerkleTree::new(leaves)
+    MerkleTree::new(&leaves)
 }
 
 fn build_scalar_merkle_tree_ext(evals: &[Ext]) -> MerkleTree {
-    MerkleTree::new(evals.iter().map(|v| v.to_bytes().to_vec()).collect())
+    let leaves: Vec<Vec<u8>> = evals.iter().map(|v| v.to_bytes().to_vec()).collect();
+    MerkleTree::new(&leaves)
 }
 
 fn open_row_merkle(tree: &MerkleTree, cols: &[Vec<BabyBear>], index: usize, num_cols: usize) -> MerkleOpening {
-    let proof = tree.get_proof(index).expect("Index out of bounds");
+    let path = tree.prove(index);
     let values: Vec<BabyBear> = (0..num_cols).map(|c| cols[c][index]).collect();
-    MerkleOpening { index, values, proof }
+    MerkleOpening { index, values, path }
 }
 
 fn open_row_merkle_ext(tree: &MerkleTree, cols: &[Vec<Ext>], index: usize, num_cols: usize) -> MerkleOpeningExt {
-    let proof = tree.get_proof(index).expect("Index out of bounds");
+    let path = tree.prove(index);
     let values: Vec<Ext> = (0..num_cols).map(|c| cols[c][index]).collect();
-    MerkleOpeningExt { index, values, proof }
+    MerkleOpeningExt { index, values, path }
 }
 
 fn open_scalar_merkle_ext(tree: &MerkleTree, evals: &[Ext], index: usize) -> ScalarOpening {
-    let proof = tree.get_proof(index).expect("Index out of bounds");
-    ScalarOpening { index, value: evals[index], proof }
+    let path = tree.prove(index);
+    ScalarOpening { index, value: evals[index], path }
 }
 
 /// Derive the out-of-domain point in the extension field. A random extension
 /// element is outside the base evaluation domain unless it happens to be a base
 /// element (negligible), so we only need to reject the base case to guarantee
 /// z, g·z ∉ domain (keeping the DEEP denominators invertible).
-fn derive_z(
-    transcript: &mut FiatShamirTranscript,
-) -> Ext {
+fn derive_z(transcript: &mut Transcript) -> Ext {
     loop {
-        let z = transcript.squeeze_ext_challenge();
+        let z = draw_ext(transcript);
         if !z.is_base() {
             return z;
         }

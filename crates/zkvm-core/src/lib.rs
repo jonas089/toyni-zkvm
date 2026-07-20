@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use toyni::babybear::BabyBear;
+use toyni::field::BabyBear;
 
 // ── Opcodes ────────────────────────────────────────────────────────────
 

@@ -10,12 +10,15 @@
 //! into `Ext` when re-deriving the constraint / DEEP values.
 
 use sha2::{Digest, Sha256};
-use toyni::babybear::BabyBear;
-use toyni::ext::Ext;
-use toyni::math::domain::BabyBearDomain;
-use toyni::math::polynomial::Polynomial;
-use toyni::merkle::{verify_merkle_proof, MerkleTree};
-use toyni::transcript::FiatShamirTranscript;
+use toyni::field::BabyBear;
+use toyni::field::BabyBearExt as Ext;
+use toyni::engine::classical::domain::BabyBearDomain;
+use toyni::polynomial::Polynomial;
+use toyni::merkle::{verify_path, Hash, MerkleTree};
+use toyni::transcript::Transcript;
+use toyni::{ClassicalEngine, Engine};
+
+fn draw_ext(t: &mut Transcript) -> Ext { ClassicalEngine::draw_ext(t) }
 
 use zkvm_air::{
     eval_transition_constraints, num_transition_constraints, permutation, TraceView,
@@ -68,7 +71,7 @@ impl ZkvmVerifier {
         let z_poly = Polynomial::new(domain.vanishing_poly_coeffs());
 
         // ── 1. Replay Fiat-Shamir ────────────────────────────────────
-        let mut transcript = FiatShamirTranscript::new();
+        let mut transcript = Transcript::new(b"zkvm");
         transcript.absorb_commitment(&proof.program_hash);
         transcript.absorb_field(BabyBear::from_u32(proof.entry_pc));
         for &v in &proof.public_inputs { transcript.absorb_field(BabyBear::from_u32(v)); }
@@ -78,12 +81,12 @@ impl ZkvmVerifier {
         transcript.absorb_commitment(&proof.trace_commitment);
 
         let gammas: [Ext; 4] = [
-            transcript.squeeze_ext_challenge(), transcript.squeeze_ext_challenge(),
-            transcript.squeeze_ext_challenge(), transcript.squeeze_ext_challenge(),
+            draw_ext(&mut transcript), draw_ext(&mut transcript),
+            draw_ext(&mut transcript), draw_ext(&mut transcript),
         ];
         let alphas: [Ext; 4] = [
-            transcript.squeeze_ext_challenge(), transcript.squeeze_ext_challenge(),
-            transcript.squeeze_ext_challenge(), transcript.squeeze_ext_challenge(),
+            draw_ext(&mut transcript), draw_ext(&mut transcript),
+            draw_ext(&mut transcript), draw_ext(&mut transcript),
         ];
         if gammas != proof.gammas || alphas != proof.alphas { return false; }
 
@@ -97,18 +100,18 @@ impl ZkvmVerifier {
         let total_with_boundary = total_constraints + num_b_first + num_b_last;
 
         let cweights: Vec<Ext> = (0..total_with_boundary)
-            .map(|_| transcript.squeeze_ext_challenge())
+            .map(|_| draw_ext(&mut transcript))
             .collect();
 
         transcript.absorb_commitment(&proof.quotient_commitment);
 
         let z = derive_z_verifier(&mut transcript);
 
-        for &v in &proof.trace_at_z { transcript.absorb_ext(v); }
-        for &v in &proof.trace_at_gz { transcript.absorb_ext(v); }
-        for &v in &proof.accum_at_z { transcript.absorb_ext(v); }
-        for &v in &proof.accum_at_gz { transcript.absorb_ext(v); }
-        transcript.absorb_ext(proof.q_z);
+        for &v in &proof.trace_at_z { transcript.absorb_field(v); }
+        for &v in &proof.trace_at_gz { transcript.absorb_field(v); }
+        for &v in &proof.accum_at_z { transcript.absorb_field(v); }
+        for &v in &proof.accum_at_gz { transcript.absorb_field(v); }
+        transcript.absorb_field(proof.q_z);
 
         // ── 2. OOD constraint quotient consistency ───────────────────
         let omega_nm1 = Ext::from(g.pow((trace_len - 1) as u64));
@@ -239,7 +242,7 @@ impl ZkvmVerifier {
         // ── 6. Squeeze DEEP coefficients ─────────────────────────────
         let num_deep_terms = 2 * num_cols + 2 * num_accum_cols + 1;
         let deep_coeffs: Vec<Ext> = (0..num_deep_terms)
-            .map(|_| transcript.squeeze_ext_challenge())
+            .map(|_| draw_ext(&mut transcript))
             .collect();
 
         // ── 7. Replay FRI commitments / betas ────────────────────────
@@ -261,14 +264,14 @@ impl ZkvmVerifier {
         transcript.absorb_commitment(&proof.fri_commitments[0]);
         let mut fri_betas: Vec<Ext> = Vec::new();
         for i in 1..proof.fri_commitments.len() {
-            let beta = transcript.squeeze_ext_challenge();
+            let beta = draw_ext(&mut transcript);
             fri_betas.push(beta);
             transcript.absorb_commitment(&proof.fri_commitments[i]);
         }
 
         // ── 8. Query indices ─────────────────────────────────────────
         let first_layer_half = lde_size / 2;
-        let query_indices = transcript.squeeze_indices(NUM_QUERIES, first_layer_half);
+        let query_indices = transcript.draw_indices(NUM_QUERIES, first_layer_half);
         if proof.query_proofs.len() != NUM_QUERIES { return false; }
 
         let shifted_elements = shifted_domain.elements();
@@ -365,33 +368,32 @@ impl ZkvmVerifier {
     }
 }
 
-fn verify_row_opening(opening: &MerkleOpening, root: &[u8], num_cols: usize) -> bool {
+fn verify_row_opening(opening: &MerkleOpening, root: &Hash, num_cols: usize) -> bool {
     if opening.values.len() != num_cols { return false; }
     let mut h = Sha256::new();
     for v in &opening.values { h.update(v.to_bytes()); }
     let leaf = h.finalize().to_vec();
-    verify_merkle_proof(leaf, &opening.proof, &root.to_vec())
+    verify_path(root, opening.index, &leaf, &opening.path)
 }
 
-fn verify_row_opening_ext(opening: &MerkleOpeningExt, root: &[u8], num_cols: usize) -> bool {
+fn verify_row_opening_ext(opening: &MerkleOpeningExt, root: &Hash, num_cols: usize) -> bool {
     if opening.values.len() != num_cols { return false; }
     let mut h = Sha256::new();
     for v in &opening.values { h.update(v.to_bytes()); }
     let leaf = h.finalize().to_vec();
-    verify_merkle_proof(leaf, &opening.proof, &root.to_vec())
+    verify_path(root, opening.index, &leaf, &opening.path)
 }
 
-fn verify_scalar_opening(opening: &ScalarOpening, root: &[u8]) -> bool {
+fn verify_scalar_opening(opening: &ScalarOpening, root: &Hash) -> bool {
     let leaf = opening.value.to_bytes().to_vec();
-    verify_merkle_proof(leaf, &opening.proof, &root.to_vec())
+    verify_path(root, opening.index, &leaf, &opening.path)
 }
 
 /// Recompute the Merkle root of an Ext-valued layer, matching the prover's
 /// `build_scalar_merkle_tree_ext` (leaf = Ext little-endian bytes).
-fn merkle_root_of_ext(values: &[Ext]) -> Vec<u8> {
-    MerkleTree::new(values.iter().map(|v| v.to_bytes().to_vec()).collect())
-        .root()
-        .unwrap()
+fn merkle_root_of_ext(values: &[Ext]) -> Hash {
+    let leaves: Vec<Vec<u8>> = values.iter().map(|v| v.to_bytes().to_vec()).collect();
+    MerkleTree::new(&leaves).root()
 }
 
 /// Barycentric-style Lagrange evaluation of a base-valued table at the
@@ -413,9 +415,9 @@ fn lagrange_ext(values: &[BabyBear], z: Ext, domain: &BabyBearDomain) -> Ext {
 
 /// Derive the out-of-domain point in the extension field. A non-base extension
 /// element is automatically outside the base domain (so z, g·z avoid it).
-fn derive_z_verifier(transcript: &mut FiatShamirTranscript) -> Ext {
+fn derive_z_verifier(transcript: &mut Transcript) -> Ext {
     loop {
-        let z = transcript.squeeze_ext_challenge();
+        let z = draw_ext(transcript);
         if !z.is_base() {
             return z;
         }

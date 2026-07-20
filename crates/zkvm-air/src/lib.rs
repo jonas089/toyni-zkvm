@@ -35,8 +35,8 @@
 //! the random challenges from `Ext` is what lifts the lookup / permutation and
 //! FRI soundness from ~31 bits (base field) to ~124 bits.
 
-use toyni::babybear::BabyBear;
-use toyni::ext::Ext;
+use toyni::field::BabyBear;
+use toyni::field::BabyBearExt as Ext;
 
 use zkvm_core::{accum, col, NUM_ACCUM_COLS, NUM_CHANNELS, NUM_OPCODES, NUM_TRACE_COLS};
 

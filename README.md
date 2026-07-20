@@ -19,9 +19,11 @@ proving backend.
   engine**. Because the engine geometry is now abstracted, a circle-engine
   VM is a change of the geometry layer (out-of-domain point, single-point
   quotient denominators, FRI fold, extension-column FFT) rather than a
-  rewrite; the main protocol adaptation it needs is moving the single-row
-  transition exclusion to the circle-friendly two-row form. That port is
-  tracked, not yet landed.
+  rewrite — the circle engine already provides single-point vanishing
+  functions (its boundary quotients use them), so even the single-row
+  transition exclusion maps over directly. It is a mechanical refactor of
+  the prover/verifier to call the engine for geometry; tracked, not yet
+  landed.
 - **Toyni (legacy note)**: solid core STARK toolkit + CUDA NTT path.
 - **zkvm (this repo)**: the AIR aims to be a *fully constrained* minimal
   VM — every trace column is fixed by a transition/boundary constraint or

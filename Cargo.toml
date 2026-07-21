@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-toyni = { path = "../toyni", default-features = false, features = ["parallel"] }
+toyni = { path = "../toyni", default-features = false, features = ["parallel", "circle"] }
 zkvm-core = { path = "crates/zkvm-core" }
 zkvm-air = { path = "crates/zkvm-air" }
 zkvm-prover = { path = "crates/zkvm-prover" }

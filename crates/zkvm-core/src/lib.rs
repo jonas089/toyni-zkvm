@@ -120,6 +120,10 @@ impl VmState {
     }
 }
 
+impl Default for VmState {
+    fn default() -> Self { Self::new() }
+}
+
 /// What the AIR needs to see for one cycle.
 #[derive(Debug, Clone)]
 pub struct StepRecord {
@@ -620,6 +624,7 @@ fn fill_sort_aux_reg<B: Field>(
 /// shape (it's "negative") so we leave the bits at zero. The AIR marks the
 /// range-check constraint as a main transition so it's excepted at the
 /// last row.
+#[allow(clippy::too_many_arguments)]
 fn fill_sort_aux_with_clks<B: Field>(
     cols: &mut [Vec<B>],
     i: usize,

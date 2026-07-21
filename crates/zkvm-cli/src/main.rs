@@ -10,7 +10,8 @@ use std::env;
 use std::fs;
 use std::process;
 
-use toyni::field::BabyBear;
+use toyni::engine::Engine;
+use toyni::{ClassicalEngine, CircleEngine};
 use zkvm_core::{build_columns, hash_program, run, Instruction};
 use zkvm_prover::ZkvmProver;
 use zkvm_verifier::ZkvmVerifier;
@@ -31,15 +32,17 @@ fn cmd_prove(args: &[String]) {
     let path = &args[0];
     let mut public_inputs: Vec<u32> = Vec::new();
     let mut use_cuda = false;
+    let mut use_circle = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--cuda" => { use_cuda = true; i += 1; }
+            "--circle" => { use_circle = true; i += 1; }
             "-i" => {
                 i += 1;
                 while i < args.len() && !args[i].starts_with("--") && args[i] != "-i" {
                     let v: u64 = args[i].parse().expect("bad public input");
-                    public_inputs.push((v % zkvm_core::P as u64) as u32);
+                    public_inputs.push(v as u32); // reduced per-engine below
                     i += 1;
                 }
             }
@@ -71,40 +74,48 @@ fn cmd_prove(args: &[String]) {
     };
     eprintln!("[cli] program: {} instructions", program.len());
 
+    let _ = use_cuda;
+    let engine = if use_circle { "circle (M31)" } else { "roots-of-unity (BabyBear)" };
+    eprintln!("[cli] engine: {}", engine);
+    let ok = if use_circle {
+        prove_verify::<CircleEngine>(&program, &public_inputs, zkvm_core::P_M31)
+    } else {
+        prove_verify::<ClassicalEngine>(&program, &public_inputs, zkvm_core::P)
+    };
+    if !ok {
+        process::exit(1);
+    }
+}
+
+/// Run the VM, build the trace over `E::Base`, prove and verify.
+fn prove_verify<E: Engine>(program: &[Instruction], raw_inputs: &[u32], p: u32) -> bool {
+    let public_inputs: Vec<u32> = raw_inputs.iter().map(|&v| ((v as u64) % p as u64) as u32).collect();
     let max_steps = 1usize << 20;
-    let (records, outputs) = match run(&program, &public_inputs, max_steps, zkvm_core::P) {
+    let (records, outputs) = match run(program, &public_inputs, max_steps, p) {
         Ok(r) => r,
-        Err(e) => { eprintln!("run error: {}", e); process::exit(1); }
+        Err(e) => { eprintln!("run error: {}", e); std::process::exit(1); }
     };
     eprintln!("[cli] executed {} cycles, outputs={:?}", records.len(), outputs);
 
-    let (columns, _n_real) = build_columns::<BabyBear>(&records, &program, &public_inputs, &outputs);
-    let program_hash = hash_program(&program);
-    let program_rom: Vec<(u32, u32, u32, u32, u32)> = program.iter().enumerate()
+    let (columns, _n_real) =
+        build_columns::<E::Base>(&records, program, &public_inputs, &outputs);
+    let program_hash = hash_program(program);
+    let program_rom: Vec<(u32, u32, u32, u32, u32)> = program
+        .iter()
+        .enumerate()
         .map(|(i, ins)| (i as u32, ins.op as u32, ins.a, ins.b, ins.c))
         .collect();
 
-    eprintln!("[cli] generating proof (cuda={})...", use_cuda);
-    let prover = ZkvmProver::new(
-        columns,
-        program_hash,
-        public_inputs.clone(),
-        outputs.clone(),
-        0, // entry_pc
-        program_rom,
-    );
-    let proof = prover.prove(use_cuda);
+    eprintln!("[cli] generating proof...");
+    let prover = ZkvmProver::<E>::new(columns, program_hash, public_inputs, outputs, 0, program_rom);
+    let proof = prover.prove();
 
     eprintln!("[cli] verifying proof...");
-    let verifier = ZkvmVerifier;
-    // Pin verification to the program we actually assembled (recompute the
-    // hash from our own copy) and the entry point we intended — never trust
-    // the prover-supplied hash/entry_pc in the proof.
-    let expected_entry_pc = 0u32;
-    if verifier.verify(&proof, &program_hash, expected_entry_pc) {
+    if ZkvmVerifier.verify::<E>(&proof, &program_hash, 0) {
         eprintln!("[cli] proof VERIFIED. trace_len={}, outputs={:?}", proof.trace_len, proof.public_outputs);
+        true
     } else {
         eprintln!("[cli] proof FAILED verification");
-        process::exit(1);
+        false
     }
 }

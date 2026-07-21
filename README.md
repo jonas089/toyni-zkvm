@@ -11,19 +11,23 @@ proving backend.
 
 ## Status
 
-- **Toyni (proving backend)**: now a **dual-engine** STARK library — the
-  classical roots-of-unity STARK over BabyBear *and* a circle STARK over
-  Mersenne-31, behind one generic `Air`/`Engine` architecture (see the
-  toyni README). This zkVM builds on the local merged toyni and its full
-  LogUp/grand-product VM proves and verifies on the **roots-of-unity
-  engine**. Because the engine geometry is now abstracted, a circle-engine
-  VM is a change of the geometry layer (out-of-domain point, single-point
-  quotient denominators, FRI fold, extension-column FFT) rather than a
-  rewrite — the circle engine already provides single-point vanishing
-  functions (its boundary quotients use them), so even the single-row
-  transition exclusion maps over directly. It is a mechanical refactor of
-  the prover/verifier to call the engine for geometry; tracked, not yet
-  landed.
+- **Dual-engine, both modes working.** The proving backend
+  ([toyni](https://github.com/jonas089/toyni)) is now a dual-engine STARK
+  library — the classical roots-of-unity STARK over BabyBear *and* a circle
+  STARK over Mersenne-31, behind one generic `Engine` trait. This zkVM's
+  entire stack (VM interpreter, AIR with LogUp / grand-product accumulators,
+  prover, verifier) is generic over the engine, so the **same VM proves and
+  verifies on either engine**:
+
+  ```sh
+  cargo run -p zkvm-cli -- prove examples/fibonacci.mini -i 30            # roots-of-unity (BabyBear)
+  cargo run -p zkvm-cli -- prove examples/fibonacci.mini -i 30 --circle   # circle (M31)
+  ```
+
+  Both produce `fib(30) = 832040` and verify. The VM is field-native, so the
+  `--circle` run computes in M31 rather than BabyBear; the ISA, AIR, and
+  soundness argument are identical. Tamper-rejection is tested on both
+  engines (`cargo test -p zkvm-verifier`).
 - **Toyni (legacy note)**: solid core STARK toolkit + CUDA NTT path.
 - **zkvm (this repo)**: the AIR aims to be a *fully constrained* minimal
   VM — every trace column is fixed by a transition/boundary constraint or

@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if)]
 //! Compiler for `mini`, the very-simple DSL on top of the zkvm asm.
 //!
 //! Each statement compiles to one or a few asm lines. No nested expressions:

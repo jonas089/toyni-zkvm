@@ -1,3 +1,4 @@
+#![allow(clippy::assign_op_pattern, clippy::needless_range_loop)]
 //! AIR for the small custom VM.
 //!
 //! The goal of this constraint set is a *fully constrained* minimal VM: every
@@ -35,8 +36,7 @@
 //! the random challenges from `Ext` is what lifts the lookup / permutation and
 //! FRI soundness from ~31 bits (base field) to ~124 bits.
 
-use toyni::field::{BabyBear, ExtField, Field};
-use toyni::field::BabyBearExt as Ext;
+use toyni::field::{ExtField, Field};
 
 /// Extension-field element from a small integer (constant helper).
 pub(crate) fn xf<X: Field>(v: u32) -> X { X::from_u64(v as u64) }
@@ -738,6 +738,7 @@ pub fn validate_full_trace<B: Field, X: ExtField<B>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use toyni::field::{BabyBear, BabyBearExt as Ext};
     use zkvm_core::{build_columns, run, Instruction, Opcode};
 
     // A small program: r1 = 5; write r1; halt. No memory, no input.

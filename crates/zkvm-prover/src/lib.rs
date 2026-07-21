@@ -1,129 +1,108 @@
-//! STARK prover for the small custom VM, built on Toyni primitives.
+#![allow(clippy::assign_op_pattern, clippy::needless_range_loop)]
+//! Engine-generic STARK prover for the small custom VM.
 //!
-//! Two-phase commit: trace, then accumulator columns. Then a combined
-//! quotient over (transition + accumulator + boundary) constraints, then
-//! DEEP composition + FRI + queries.
+//! The proof pipeline — commit the trace, commit the permutation/lookup
+//! accumulators, commit the combined constraint quotient, sample out-of-domain,
+//! batch the single-point DEEP quotients, FRI to a constant final layer — is
+//! written once over `toyni::Engine`. Switching from the roots-of-unity engine
+//! to the circle engine changes only the field, domain geometry, FFT and FRI;
+//! the VM's constraint logic (transitions + LogUp / grand-product
+//! accumulators) is field-generic and untouched.
 
+use rand::Rng;
 use sha2::{Digest, Sha256};
-use toyni::field::BabyBear;
-use toyni::field::BabyBearExt as Ext;
-use toyni::engine::classical::domain::BabyBearDomain;
-use toyni::engine::classical::fri_fold::fri_fold_ext;
-use toyni::mask::{mask_poly_base, mask_poly_ext};
-use toyni::polynomial::Polynomial;
+
+use toyni::engine::Engine;
+use toyni::field::{batch_inverse, ExtField, Field};
 use toyni::merkle::{Hash, MerkleTree};
-use toyni::{ClassicalEngine, Engine};
 use toyni::transcript::Transcript;
 
-/// Draw a BabyBear quartic-extension Fiat-Shamir challenge.
-fn draw_ext(t: &mut Transcript) -> Ext { ClassicalEngine::draw_ext(t) }
-
-use zkvm_air::{
-    eval_transition_constraints, num_transition_constraints, permutation, TraceView,
-};
+use zkvm_air::{eval_transition_constraints, num_transition_constraints, permutation, TraceView};
 use zkvm_core::{accum, col, NUM_ACCUM_COLS, NUM_CHANNELS, NUM_TRACE_COLS};
 
-/// Spot-check queries. The tested RS rate is at most 1/2 (~1 bit each), so 132
-/// queries give ~2^-132.
+/// Spot-check queries (~2^-132 at the tested rate).
 pub const NUM_QUERIES: usize = 132;
-/// LDE blowup. Masking pushes deg(D) up to ~8*n on the small test trace, so
-/// blowup 16 keeps the FRI rate <= 1/2 (better on large traces).
+/// LDE blowup.
 pub const BLOWUP: usize = 16;
-/// Max total degree of any AIR constraint: the register grand product (acc
-/// times 3 slot factors) and the memory read-after-write check are degree 4.
+/// Max total degree of any AIR constraint (register grand product is degree 4).
 pub const COMPOSITION_DEGREE: usize = 4;
-/// Random blinding coefficients per committed column (X_hat = X + Z_H * R).
-/// Covers every revealed evaluation: 2 openings per query + 2 OOD points.
+/// Random blinding coefficients per committed column.
 pub const MASK_DEGREE: usize = 2 * NUM_QUERIES + 4;
-/// Coset shift used for the LDE domain.
-pub const COSET_SHIFT: u64 = 7;
+const SALT_LEN: usize = 16;
 
 /// FRI degree bound: smallest power of two above deg(D) of the masked DEEP
-/// composition. The prover folds to a final layer of size lde/D_BOUND.
+/// composition; the prover folds to a final layer of size lde/D_BOUND.
 pub fn fri_degree_bound(trace_len: usize) -> usize {
     (COMPOSITION_DEGREE * (trace_len + MASK_DEGREE) - trace_len).next_power_of_two()
 }
 
+/// Number of first-row boundary constraints.
+pub fn num_b_first() -> usize {
+    5 + 5 * NUM_CHANNELS + 2
+}
+
 // ── proof data structures ─────────────────────────────────────────────
 
-/// Opening of a base-field committed row (the trace).
+/// Opening of a committed row: the column values, the leaf salt, and the
+/// Merkle path. The row position is derived by the verifier.
 #[derive(Debug, Clone)]
-pub struct MerkleOpening {
-    pub index: usize,
-    pub values: Vec<BabyBear>,
+pub struct RowOpening<F> {
+    pub values: Vec<F>,
+    pub salt: [u8; SALT_LEN],
     pub path: Vec<Hash>,
 }
 
-/// Opening of an extension-field committed row (the accumulators).
+/// Opening of a single committed scalar.
 #[derive(Debug, Clone)]
-pub struct MerkleOpeningExt {
-    pub index: usize,
-    pub values: Vec<Ext>,
+pub struct ScalarOpening<F> {
+    pub value: F,
+    pub salt: [u8; SALT_LEN],
     pub path: Vec<Hash>,
 }
 
+/// Per-query openings. `trace`/`accum` are opened at `[qi, next(qi), qi+half,
+/// next(qi+half)]` (self + next-row, for the query and its FRI sibling); the
+/// quotient at `[qi, qi+half]`.
 #[derive(Debug, Clone)]
-pub struct QueryProof {
-    pub index: usize,
-    pub trace_opening: MerkleOpening,
-    pub trace_opening_g: MerkleOpening,
-    pub accum_opening: MerkleOpeningExt,
-    pub accum_opening_g: MerkleOpeningExt,
-    pub quotient_opening: ScalarOpening,
-    pub deep_opening: ScalarOpening,
-    pub deep_opening_pair: ScalarOpening,
-    pub fri_openings: Vec<(ScalarOpening, ScalarOpening)>,
+pub struct QueryProof<E: Engine> {
+    pub trace: Vec<RowOpening<E::Base>>,
+    pub accum: Vec<RowOpening<E::Ext>>,
+    pub quotient: Vec<ScalarOpening<E::Ext>>,
 }
 
-/// Opening of a single extension-field committed value (quotient / DEEP / FRI).
-#[derive(Debug, Clone)]
-pub struct ScalarOpening {
-    pub index: usize,
-    pub value: Ext,
-    pub path: Vec<Hash>,
-}
-
-#[derive(Debug)]
-pub struct ZkvmProof {
+#[derive(Clone)]
+pub struct ZkvmProof<E: Engine> {
     pub trace_len: usize,
-    pub lde_size: usize,
     pub num_cols: usize,
     pub num_accum_cols: usize,
 
-    pub trace_commitment: Hash,
-    pub accum_commitment: Hash,
-    pub quotient_commitment: Hash,
+    pub trace_root: Hash,
+    pub accum_root: Hash,
+    pub quotient_root: Hash,
 
-    pub trace_at_z: Vec<Ext>,
-    pub trace_at_gz: Vec<Ext>,
-    pub accum_at_z: Vec<Ext>,
-    pub accum_at_gz: Vec<Ext>,
-    pub q_z: Ext,
+    pub trace_at_z: Vec<E::Ext>,
+    pub trace_at_gz: Vec<E::Ext>,
+    pub accum_at_z: Vec<E::Ext>,
+    pub accum_at_gz: Vec<E::Ext>,
+    pub q_z: E::Ext,
 
-    pub gammas: [Ext; 4],
-    pub alphas: [Ext; 4],
+    pub gammas: [E::Ext; 4],
+    pub alphas: [E::Ext; 4],
 
-    pub fri_commitments: Vec<Hash>,
-    /// Full final FRI layer (size lde/D_BOUND), sent in clear; the verifier
-    /// checks it is constant. This is what enforces the low-degree bound.
-    pub fri_final_layer: Vec<Ext>,
-    pub query_proofs: Vec<QueryProof>,
+    pub fri: E::FriProof,
+    pub queries: Vec<QueryProof<E>>,
 
     pub program_hash: [u8; 32],
     pub public_inputs: Vec<u32>,
     pub public_outputs: Vec<u32>,
     pub entry_pc: u32,
-
-    /// Program ROM as a list of (addr, opcode, op_a, op_b, op_c) tuples,
-    /// in canonical order. Used by the verifier to Lagrange-bind the
-    /// program-table columns at the OOD point.
     pub program_rom: Vec<(u32, u32, u32, u32, u32)>,
 }
 
 // ── prover ────────────────────────────────────────────────────────────
 
-pub struct ZkvmProver {
-    columns: Vec<Vec<BabyBear>>,
+pub struct ZkvmProver<E: Engine> {
+    columns: Vec<Vec<E::Base>>,
     program_hash: [u8; 32],
     public_inputs: Vec<u32>,
     public_outputs: Vec<u32>,
@@ -131,9 +110,9 @@ pub struct ZkvmProver {
     program_rom: Vec<(u32, u32, u32, u32, u32)>,
 }
 
-impl ZkvmProver {
+impl<E: Engine> ZkvmProver<E> {
     pub fn new(
-        columns: Vec<Vec<BabyBear>>,
+        columns: Vec<Vec<E::Base>>,
         program_hash: [u8; 32],
         public_inputs: Vec<u32>,
         public_outputs: Vec<u32>,
@@ -144,421 +123,311 @@ impl ZkvmProver {
         let n = columns[0].len();
         assert!(n.is_power_of_two() && n >= 2);
         assert_eq!(columns.len(), NUM_TRACE_COLS);
-        for c in &columns { assert_eq!(c.len(), n); }
+        for c in &columns {
+            assert_eq!(c.len(), n);
+        }
         Self {
-            columns, program_hash, public_inputs, public_outputs, entry_pc, program_rom,
+            columns,
+            program_hash,
+            public_inputs,
+            public_outputs,
+            entry_pc,
+            program_rom,
         }
     }
 
-    pub fn prove(&self, use_gpu: bool) -> ZkvmProof {
-        let t_total = std::time::Instant::now();
+    pub fn prove(&self) -> ZkvmProof<E> {
         let num_cols = self.columns.len();
         let trace_len = self.columns[0].len();
-        let lde_size = trace_len * BLOWUP;
-        eprintln!(
-            "[prove] start: trace_len={}, lde_size={}, num_cols={}, gpu={}",
-            trace_len, lde_size, num_cols, use_gpu
-        );
-
-        let domain = BabyBearDomain::new(trace_len).with_gpu(use_gpu);
-        let extended_domain = BabyBearDomain::new(lde_size).with_gpu(use_gpu);
-        let shift = BabyBear::new(COSET_SHIFT);
-        let shifted_domain = extended_domain.get_coset(shift);
-        let g = domain.group_gen();
-        let shifted_elements = shifted_domain.elements();
-
-        // ── Phase 1: trace ───────────────────────────────────────────
-        let t = std::time::Instant::now();
-        eprintln!("[prove] [1/8] trace IFFT + LDE FFT ({} cols)...", num_cols);
-        let mut trace_polys: Vec<Vec<BabyBear>> = self.columns.iter().map(|c| domain.ifft(c)).collect();
-        // Blind the witness columns for zero-knowledge (X_hat = X + Z_H * R,
-        // equal to X on the trace domain). The public, Lagrange-bound columns
-        // (program ROM + public I/O tables) carry no witness and are checked
-        // against public data at the OOD point, so they are left unblinded.
+        let log_trace = trace_len.trailing_zeros();
+        let log_eval = log_trace + BLOWUP.trailing_zeros();
+        let lde_size = 1usize << log_eval;
+        let log_bound = fri_degree_bound(trace_len).trailing_zeros();
         let mut rng = rand::thread_rng();
-        let public_cols = [
-            col::PROG, col::PROG + 1, col::PROG + 2, col::PROG + 3, col::PROG + 4, col::PROG + 6,
-            col::PUB_IN, col::PUB_IN + 1, col::PUB_IN + 2,
-            col::PUB_OUT, col::PUB_OUT + 1, col::PUB_OUT + 2,
-        ];
-        for (i, p) in trace_polys.iter_mut().enumerate() {
-            if !public_cols.contains(&i) {
-                mask_poly_base(p, trace_len, MASK_DEGREE, &mut rng);
+
+        let trace_tf = E::transform(log_trace);
+        let eval_tf = E::transform(log_eval);
+        let points = E::eval_points(log_eval);
+        let rotation_step = E::rotation_step(log_trace, log_eval);
+        let vn = E::vanishing_over_eval(log_trace, &points);
+        let mask_log = (2 * MASK_DEGREE)
+            .next_power_of_two()
+            .trailing_zeros()
+            .min(log_trace);
+
+        // ── Phase 1: trace ──────────────────────────────────────────────
+        let mut trace_coeffs: Vec<Vec<E::Base>> = Vec::with_capacity(num_cols);
+        let mut trace_mask: Vec<Vec<E::Base>> = Vec::with_capacity(num_cols);
+        let mut trace_lde: Vec<Vec<E::Base>> = Vec::with_capacity(num_cols);
+        for (c, col_vals) in self.columns.iter().enumerate() {
+            // Only witness columns are blinded; the public Lagrange-bound tables
+            // (program ROM + public I/O) carry no witness and stay unblinded.
+            let blind = c < col::PROG;
+            let mut values = vec![E::Base::ZERO; trace_len];
+            for (row, &v) in col_vals.iter().enumerate() {
+                values[E::fft_index_of_row(log_trace, row)] = v;
             }
+            E::interpolate(&mut values, &trace_tf);
+            let coeffs = values;
+            let mut lde = E::evaluate_lde(&coeffs, log_trace, log_eval, &eval_tf);
+            let r: Vec<E::Base> = if blind {
+                (0..1usize << mask_log)
+                    .map(|_| E::Base::random(&mut rng))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if blind {
+                let r_lde = E::evaluate_lde(&r, mask_log, log_eval, &eval_tf);
+                for i in 0..lde_size {
+                    lde[i] += vn[i] * r_lde[i];
+                }
+            }
+            trace_coeffs.push(coeffs);
+            trace_mask.push(r);
+            trace_lde.push(lde);
         }
-        let trace_lde: Vec<Vec<BabyBear>> = trace_polys.iter().map(|c| shifted_domain.fft(c)).collect();
-        eprintln!("[prove] [1/8] FFTs done in {:.2?}", t.elapsed());
-        let t = std::time::Instant::now();
-        let trace_tree = build_row_merkle_tree(&trace_lde, lde_size);
-        let trace_commitment = trace_tree.root();
-        eprintln!("[prove] [1/8] trace merkle done in {:.2?}", t.elapsed());
+        let trace_salts = salts(lde_size, &mut rng);
+        let trace_tree = commit_rows::<E::Base>(&trace_lde, &trace_salts);
+        let trace_root = trace_tree.root();
 
         let mut transcript = Transcript::new(b"zkvm");
         transcript.absorb_commitment(&self.program_hash);
-        transcript.absorb_field(BabyBear::from_u32(self.entry_pc));
-        for &v in &self.public_inputs { transcript.absorb_field(BabyBear::from_u32(v)); }
-        for &v in &self.public_outputs { transcript.absorb_field(BabyBear::from_u32(v)); }
-        transcript.absorb_field(BabyBear::from_u32(self.public_inputs.len() as u32));
-        transcript.absorb_field(BabyBear::from_u32(self.public_outputs.len() as u32));
-        transcript.absorb_commitment(&trace_commitment);
+        transcript.absorb_field(E::Base::from_u64(self.entry_pc as u64));
+        for &v in &self.public_inputs {
+            transcript.absorb_field(E::Base::from_u64(v as u64));
+        }
+        for &v in &self.public_outputs {
+            transcript.absorb_field(E::Base::from_u64(v as u64));
+        }
+        transcript.absorb_field(E::Base::from_u64(self.public_inputs.len() as u64));
+        transcript.absorb_field(E::Base::from_u64(self.public_outputs.len() as u64));
+        transcript.absorb_commitment(&trace_root);
 
-        // ── Phase 2: accumulators ────────────────────────────────────
-        // Lookup / permutation challenges are drawn from the extension field
-        // for ~124-bit soundness.
-        let gammas: [Ext; 4] = [
-            draw_ext(&mut transcript), draw_ext(&mut transcript),
-            draw_ext(&mut transcript), draw_ext(&mut transcript),
-        ];
-        let alphas: [Ext; 4] = [
-            draw_ext(&mut transcript), draw_ext(&mut transcript),
-            draw_ext(&mut transcript), draw_ext(&mut transcript),
-        ];
+        // ── Phase 2: accumulators ───────────────────────────────────────
+        let gammas: [E::Ext; 4] = std::array::from_fn(|_| E::draw_ext(&mut transcript));
+        let alphas: [E::Ext; 4] = std::array::from_fn(|_| E::draw_ext(&mut transcript));
 
-        let t = std::time::Instant::now();
-        eprintln!("[prove] [2/8] compute accumulators...");
-        let accum_columns = permutation::compute_accumulators(&self.columns, &gammas, &alphas);
+        let accum_columns =
+            permutation::compute_accumulators::<E::Base, E::Ext>(&self.columns, &gammas, &alphas);
         assert_eq!(accum_columns.len(), NUM_ACCUM_COLS);
-        eprintln!("[prove] [2/8] accumulators done in {:.2?}", t.elapsed());
+        zkvm_air::validate_full_trace::<E::Base, E::Ext>(
+            &self.columns,
+            &accum_columns,
+            &gammas,
+            &alphas,
+        )
+        .expect("trace fails AIR validation");
 
-        // Self-check: every constraint should evaluate to zero on the trace.
-        if let Err(e) = zkvm_air::validate_full_trace(&self.columns, &accum_columns, &gammas, &alphas) {
-            panic!("trace fails validation: {}", e);
+        let mut accum_coeffs: Vec<Vec<E::Ext>> = Vec::with_capacity(NUM_ACCUM_COLS);
+        let mut accum_mask: Vec<Vec<E::Ext>> = Vec::with_capacity(NUM_ACCUM_COLS);
+        let mut accum_lde: Vec<Vec<E::Ext>> = Vec::with_capacity(NUM_ACCUM_COLS);
+        for col_vals in &accum_columns {
+            let mut values = vec![E::Ext::ZERO; trace_len];
+            for (row, &v) in col_vals.iter().enumerate() {
+                values[E::fft_index_of_row(log_trace, row)] = v;
+            }
+            E::interpolate_ext(&mut values, &trace_tf);
+            let coeffs = values;
+            let mut lde = E::evaluate_lde_ext(&coeffs, log_trace, log_eval, &eval_tf);
+            let r: Vec<E::Ext> = (0..1usize << mask_log)
+                .map(|_| E::Ext::random(&mut rng))
+                .collect();
+            let r_lde = E::evaluate_lde_ext(&r, mask_log, log_eval, &eval_tf);
+            for i in 0..lde_size {
+                lde[i] = lde[i] + r_lde[i].mul_base(vn[i]);
+            }
+            accum_coeffs.push(coeffs);
+            accum_mask.push(r);
+            accum_lde.push(lde);
         }
+        let accum_salts = salts(lde_size, &mut rng);
+        let accum_tree = commit_rows::<E::Ext>(&accum_lde, &accum_salts);
+        let accum_root = accum_tree.root();
+        transcript.absorb_commitment(&accum_root);
 
-        let t = std::time::Instant::now();
-        eprintln!("[prove] [2/8] accum IFFT + LDE FFT ({} cols)...", NUM_ACCUM_COLS);
-        let mut accum_polys: Vec<Vec<Ext>> = accum_columns.iter().map(|c| domain.ifft_ext(c)).collect();
-        for p in accum_polys.iter_mut() {
-            mask_poly_ext(p, trace_len, MASK_DEGREE, &mut rng);
-        }
-        let accum_lde: Vec<Vec<Ext>> = accum_polys.iter().map(|c| shifted_domain.fft_ext(c)).collect();
-        eprintln!("[prove] [2/8] accum FFTs done in {:.2?}", t.elapsed());
-        let t = std::time::Instant::now();
-        let accum_tree = build_row_merkle_tree_ext(&accum_lde, lde_size);
-        let accum_commitment = accum_tree.root();
-        eprintln!("[prove] [2/8] accum merkle done in {:.2?}", t.elapsed());
-        transcript.absorb_commitment(&accum_commitment);
-
-        // ── Phase 3: combined constraint quotient ────────────────────
-        let num_main = num_transition_constraints::<Ext>();
+        // ── Phase 3: combined constraint quotient ───────────────────────
+        let num_main = num_transition_constraints::<E::Ext>();
         let num_accum = permutation::num_accum_constraints();
         let total_constraints = num_main + num_accum;
-        // Boundary first-row: 5 state cells (CLK, PC, HALT, I_IN, I_OUT)
-        //   + 5 args × NUM_CHANNELS accumulator inits
-        //   + ROM entry address (PROG addr[0] = 0)
-        //   + sorted-memory init record (SORTED_BOUNDARY_ENTRY).
-        // Boundary last-row: HALT = 1.
-        let num_b_first = 5 + 5 * NUM_CHANNELS + 2;
-        let num_b_last = 1;
-        let total_with_boundary = total_constraints + num_b_first + num_b_last;
-
-        let z_poly = Polynomial::new(domain.vanishing_poly_coeffs());
-        let omega_n_minus_1 = g.pow((trace_len - 1) as u64);
-        let entry_pc_f = Ext::from_u32(self.entry_pc);
-        let omega_0 = BabyBear::one();
-
-        let cweights: Vec<Ext> = (0..total_with_boundary)
-            .map(|_| draw_ext(&mut transcript))
+        let total_with_boundary = total_constraints + num_b_first() + 1;
+        let cweights: Vec<E::Ext> = (0..total_with_boundary)
+            .map(|_| E::draw_ext(&mut transcript))
             .collect();
 
-        let t = std::time::Instant::now();
-        eprintln!(
-            "[prove] [3/8] constraint quotient over {} rows (single-threaded CPU)...",
-            lde_size
-        );
-        let progress_step = (lde_size / 16).max(1);
-        let mut q_evals = vec![Ext::zero(); lde_size];
-        for i in 0..lde_size {
-            if i > 0 && i % progress_step == 0 {
-                eprintln!(
-                    "[prove]   constraint loop {}/{}  ({:.0}%)  elapsed {:.2?}",
-                    i, lde_size,
-                    100.0 * i as f64 / lde_size as f64,
-                    t.elapsed()
-                );
-            }
-            let curr = build_trace_view(&trace_lde, i);
-            let next_idx = (i + BLOWUP) % lde_size;
-            let next = build_trace_view(&trace_lde, next_idx);
-
-            let curr_acc: Vec<Ext> = accum_lde.iter().map(|c| c[i]).collect();
-            let next_acc: Vec<Ext> = accum_lde.iter().map(|c| c[next_idx]).collect();
-
-            let main_cv = eval_transition_constraints(&curr, &next);
-            let accum_cv = permutation::eval_accum_constraints(
-                &curr, &next, &curr_acc, &next_acc, &gammas, &alphas,
-            );
-
-            // Main constraints: all excepted (zeroed at last row).
-            let mut c_excepted = Ext::zero();
-            for (j, &v) in main_cv.iter().enumerate() {
-                c_excepted = c_excepted + cweights[j] * v;
-            }
-            // Accum constraints: all wrap-around (hold everywhere).
-            let mut c_wrap = Ext::zero();
-            for (j, &v) in accum_cv.iter().enumerate() {
-                c_wrap = c_wrap + cweights[num_main + j] * v;
-            }
-
-            // x, the exception factor and the vanishing value are base-field
-            // (the domain is base); combine with the Ext constraint sums via
-            // cheap base-scalar multiplies / a base inverse.
-            let x = shifted_elements[i];
-            let exception = x - omega_n_minus_1;
-            let z_val_inv = z_poly.evaluate(x).inverse();
-            let transition_q = (c_excepted.mul_base(exception) + c_wrap).mul_base(z_val_inv);
-
-            // First-row boundaries.
-            let alpha_b = total_constraints;
-            let one = Ext::one();
-            let mut b_first = Ext::zero();
-            b_first = b_first + cweights[alpha_b]     * curr.col(col::CLK);
-            b_first = b_first + cweights[alpha_b + 1] * (curr.col(col::PC) - entry_pc_f);
-            b_first = b_first + cweights[alpha_b + 2] * curr.col(col::HALT);
-            b_first = b_first + cweights[alpha_b + 3] * curr.col(col::I_IN);
-            b_first = b_first + cweights[alpha_b + 4] * curr.col(col::I_OUT);
-            // Per-channel accumulator initial values (4 GP→1, 12 LogUp→0).
-            for ch in 0..NUM_CHANNELS {
-                b_first = b_first + cweights[alpha_b + 5 + ch] * (curr_acc[accum::REG + ch] - one);
-                b_first = b_first + cweights[alpha_b + 5 + NUM_CHANNELS + ch] * (curr_acc[accum::MEM + ch] - one);
-                b_first = b_first + cweights[alpha_b + 5 + 2 * NUM_CHANNELS + ch] * curr_acc[accum::PROG + ch];
-                b_first = b_first + cweights[alpha_b + 5 + 3 * NUM_CHANNELS + ch] * curr_acc[accum::PUB_IN + ch];
-                b_first = b_first + cweights[alpha_b + 5 + 4 * NUM_CHANNELS + ch] * curr_acc[accum::PUB_OUT + ch];
-            }
-            // ROM entry address: first ROM row is PC 0 (ROM_ENTRY_WELLFORMED).
-            let rom_b = total_constraints + 5 + 5 * NUM_CHANNELS;
-            b_first = b_first + cweights[rom_b] * curr.col(col::PROG);
-            // Sorted-memory init record: first entry, if a used read, has val 0.
-            let smem_init = curr.col(col::SMEM + 4) * (one - curr.col(col::SMEM + 3)) * curr.col(col::SMEM + 1);
-            b_first = b_first + cweights[rom_b + 1] * smem_init;
-            let b_first_q = b_first.mul_base((x - omega_0).inverse());
-
-            // Last-row boundary.
-            let alpha_l = total_constraints + num_b_first;
-            let b_last = cweights[alpha_l] * (curr.col(col::HALT) - one);
-            let b_last_q = b_last.mul_base((x - omega_n_minus_1).inverse());
-
-            q_evals[i] = transition_q + b_first_q + b_last_q;
-        }
-        eprintln!("[prove] [3/8] done in {:.2?}", t.elapsed());
-
-        // ── Phase 4: commit quotient ─────────────────────────────────
-        let t = std::time::Instant::now();
-        eprintln!("[prove] [4/8] quotient merkle...");
-        let q_tree = build_scalar_merkle_tree_ext(&q_evals);
-        let quotient_commitment = q_tree.root();
-        eprintln!("[prove] [4/8] done in {:.2?}", t.elapsed());
-        transcript.absorb_commitment(&quotient_commitment);
-
-        // ── Phase 5: OOD ─────────────────────────────────────────────
-        let t = std::time::Instant::now();
-        eprintln!("[prove] [5/8] OOD evaluation...");
-        let z = derive_z(&mut transcript);
-        let gz = z.mul_base(g);
-
-        let trace_at_z: Vec<Ext> = trace_polys.iter().map(|c| z.eval_base_at_ext(c)).collect();
-        let trace_at_gz: Vec<Ext> = trace_polys.iter().map(|c| gz.eval_base_at_ext(c)).collect();
-        let accum_at_z: Vec<Ext> = accum_polys.iter().map(|c| z.eval_ext_at_ext(c)).collect();
-        let accum_at_gz: Vec<Ext> = accum_polys.iter().map(|c| gz.eval_ext_at_ext(c)).collect();
-
-        let q_coeffs = shifted_domain.ifft_ext(&q_evals);
-        let q_z = z.eval_ext_at_ext(&q_coeffs);
-
-        // Reconstruct q(z) and verify it matches.
-        let curr_z = TraceView::<Ext> { vals: trace_at_z.clone() };
-        let next_gz = TraceView::<Ext> { vals: trace_at_gz.clone() };
-        let main_cv = eval_transition_constraints(&curr_z, &next_gz);
-        let accum_cv = permutation::eval_accum_constraints(
-            &curr_z, &next_gz, &accum_at_z, &accum_at_gz, &gammas, &alphas,
-        );
-        let mut c_excepted_z = Ext::zero();
-        for (j, &v) in main_cv.iter().enumerate() {
-            c_excepted_z = c_excepted_z + cweights[j] * v;
-        }
-        let mut c_wrap_z = Ext::zero();
-        for (j, &v) in accum_cv.iter().enumerate() {
-            c_wrap_z = c_wrap_z + cweights[num_main + j] * v;
-        }
-        let omega_nm1_e = Ext::from(omega_n_minus_1);
-        let z_at_z = z.eval_base_at_ext(z_poly.coefficients());
-        let transition_q_z = (c_excepted_z * (z - omega_nm1_e) + c_wrap_z) * z_at_z.inverse();
-
-        let one = Ext::one();
+        let inv_vh = batch_inverse(&vn);
+        let p_last = E::trace_point(log_trace, trace_len - 1);
+        let p_first = E::trace_point(log_trace, 0);
+        let excl = E::point_vanishing_over_eval(p_last, &points);
+        let inv_last = E::boundary_denom_inv_over_eval(p_last, &points);
+        let inv_first = E::boundary_denom_inv_over_eval(p_first, &points);
+        let entry_pc_e = E::Ext::from(E::Base::from_u64(self.entry_pc as u64));
         let alpha_b = total_constraints;
-        let mut b_first_z = Ext::zero();
-        b_first_z = b_first_z + cweights[alpha_b]     * trace_at_z[col::CLK];
-        b_first_z = b_first_z + cweights[alpha_b + 1] * (trace_at_z[col::PC] - entry_pc_f);
-        b_first_z = b_first_z + cweights[alpha_b + 2] * trace_at_z[col::HALT];
-        b_first_z = b_first_z + cweights[alpha_b + 3] * trace_at_z[col::I_IN];
-        b_first_z = b_first_z + cweights[alpha_b + 4] * trace_at_z[col::I_OUT];
-        for ch in 0..NUM_CHANNELS {
-            b_first_z = b_first_z + cweights[alpha_b + 5 + ch] * (accum_at_z[accum::REG + ch] - one);
-            b_first_z = b_first_z + cweights[alpha_b + 5 + NUM_CHANNELS + ch] * (accum_at_z[accum::MEM + ch] - one);
-            b_first_z = b_first_z + cweights[alpha_b + 5 + 2 * NUM_CHANNELS + ch] * accum_at_z[accum::PROG + ch];
-            b_first_z = b_first_z + cweights[alpha_b + 5 + 3 * NUM_CHANNELS + ch] * accum_at_z[accum::PUB_IN + ch];
-            b_first_z = b_first_z + cweights[alpha_b + 5 + 4 * NUM_CHANNELS + ch] * accum_at_z[accum::PUB_OUT + ch];
-        }
         let rom_b = total_constraints + 5 + 5 * NUM_CHANNELS;
-        b_first_z = b_first_z + cweights[rom_b] * trace_at_z[col::PROG];
-        let smem_init_z = trace_at_z[col::SMEM + 4] * (one - trace_at_z[col::SMEM + 3]) * trace_at_z[col::SMEM + 1];
-        b_first_z = b_first_z + cweights[rom_b + 1] * smem_init_z;
-        let b_first_qz = b_first_z * (z - one).inverse();
+        let alpha_l = total_constraints + num_b_first();
 
-        let alpha_l = total_constraints + num_b_first;
-        let b_last_z = cweights[alpha_l] * (trace_at_z[col::HALT] - one);
-        let b_last_qz = b_last_z * (z - omega_nm1_e).inverse();
+        let q_evals: Vec<E::Ext> = (0..lde_size)
+            .map(|i| {
+                let next_i = E::rotation_index(log_eval, i, rotation_step);
+                let curr = build_trace_view::<E>(&trace_lde, i);
+                let next = build_trace_view::<E>(&trace_lde, next_i);
+                let curr_acc: Vec<E::Ext> = accum_lde.iter().map(|c| c[i]).collect();
+                let next_acc: Vec<E::Ext> = accum_lde.iter().map(|c| c[next_i]).collect();
 
-        let computed_q_z = transition_q_z + b_first_qz + b_last_qz;
-        assert_eq!(computed_q_z, q_z, "OOD constraint check failed");
-        eprintln!("[prove] [5/8] done in {:.2?}", t.elapsed());
+                let main_cv = eval_transition_constraints(&curr, &next);
+                let accum_cv = permutation::eval_accum_constraints(
+                    &curr, &next, &curr_acc, &next_acc, &gammas, &alphas,
+                );
+                let mut c_excepted = E::Ext::ZERO;
+                for (j, &v) in main_cv.iter().enumerate() {
+                    c_excepted = c_excepted + cweights[j] * v;
+                }
+                let mut c_wrap = E::Ext::ZERO;
+                for (j, &v) in accum_cv.iter().enumerate() {
+                    c_wrap = c_wrap + cweights[num_main + j] * v;
+                }
+                let transition_q = (c_excepted * excl[i] + c_wrap).mul_base(inv_vh[i]);
 
-        for &v in &trace_at_z { transcript.absorb_field(v); }
-        for &v in &trace_at_gz { transcript.absorb_field(v); }
-        for &v in &accum_at_z { transcript.absorb_field(v); }
-        for &v in &accum_at_gz { transcript.absorb_field(v); }
-        transcript.absorb_field(q_z);
+                let one = E::Ext::ONE;
+                let mut b_first = E::Ext::ZERO;
+                b_first = b_first + cweights[alpha_b] * curr.col(col::CLK);
+                b_first = b_first + cweights[alpha_b + 1] * (curr.col(col::PC) - entry_pc_e);
+                b_first = b_first + cweights[alpha_b + 2] * curr.col(col::HALT);
+                b_first = b_first + cweights[alpha_b + 3] * curr.col(col::I_IN);
+                b_first = b_first + cweights[alpha_b + 4] * curr.col(col::I_OUT);
+                for ch in 0..NUM_CHANNELS {
+                    b_first = b_first + cweights[alpha_b + 5 + ch] * (curr_acc[accum::REG + ch] - one);
+                    b_first = b_first + cweights[alpha_b + 5 + NUM_CHANNELS + ch] * (curr_acc[accum::MEM + ch] - one);
+                    b_first = b_first + cweights[alpha_b + 5 + 2 * NUM_CHANNELS + ch] * curr_acc[accum::PROG + ch];
+                    b_first = b_first + cweights[alpha_b + 5 + 3 * NUM_CHANNELS + ch] * curr_acc[accum::PUB_IN + ch];
+                    b_first = b_first + cweights[alpha_b + 5 + 4 * NUM_CHANNELS + ch] * curr_acc[accum::PUB_OUT + ch];
+                }
+                b_first = b_first + cweights[rom_b] * curr.col(col::PROG);
+                let smem_init = curr.col(col::SMEM + 4) * (one - curr.col(col::SMEM + 3)) * curr.col(col::SMEM + 1);
+                b_first = b_first + cweights[rom_b + 1] * smem_init;
+                let b_first_q = b_first * inv_first[i];
 
-        // ── Phase 6: DEEP ────────────────────────────────────────────
-        let num_deep_terms = 2 * num_cols + 2 * NUM_ACCUM_COLS + 1;
-        let deep_coeffs: Vec<Ext> = (0..num_deep_terms)
-            .map(|_| draw_ext(&mut transcript))
+                let b_last = cweights[alpha_l] * (curr.col(col::HALT) - one);
+                let b_last_q = b_last * inv_last[i];
+
+                transition_q + b_first_q + b_last_q
+            })
             .collect();
 
-        let t = std::time::Instant::now();
-        eprintln!(
-            "[prove] [6/8] DEEP composition over {} rows (single-threaded CPU)...",
-            lde_size
-        );
-        let progress_step = (lde_size / 16).max(1);
-        let d_evals: Vec<Ext> = (0..lde_size).map(|i| {
-            if i > 0 && i % progress_step == 0 {
-                eprintln!(
-                    "[prove]   DEEP loop {}/{}  ({:.0}%)  elapsed {:.2?}",
-                    i, lde_size,
-                    100.0 * i as f64 / lde_size as f64,
-                    t.elapsed()
-                );
-            }
-            // x is base; the OOD points z, g·z are extension, so the
-            // denominators (x - z) etc. are extension elements.
-            let x = Ext::from(shifted_elements[i]);
-            // All DEEP quotients use denominator (x - z); for the g-shifted
-            // terms, T(g*x) - T(gz) vanishes at x = z, so they stay low-degree.
-            let inv_x_z = (x - z).inverse();
+        let q_salts = salts(lde_size, &mut rng);
+        let q_tree = commit_scalars::<E::Ext>(&q_evals, &q_salts);
+        let quotient_root = q_tree.root();
+        transcript.absorb_commitment(&quotient_root);
 
-            let mut d = Ext::zero();
-            let mut ci = 0;
-            for col_idx in 0..num_cols {
-                d = d + deep_coeffs[ci] * (Ext::from(trace_lde[col_idx][i]) - trace_at_z[col_idx]) * inv_x_z;
-                ci += 1;
-            }
-            let next_i = (i + BLOWUP) % lde_size;
-            for col_idx in 0..num_cols {
-                d = d + deep_coeffs[ci] * (Ext::from(trace_lde[col_idx][next_i]) - trace_at_gz[col_idx]) * inv_x_z;
-                ci += 1;
-            }
-            for col_idx in 0..NUM_ACCUM_COLS {
-                d = d + deep_coeffs[ci] * (accum_lde[col_idx][i] - accum_at_z[col_idx]) * inv_x_z;
-                ci += 1;
-            }
-            for col_idx in 0..NUM_ACCUM_COLS {
-                d = d + deep_coeffs[ci] * (accum_lde[col_idx][next_i] - accum_at_gz[col_idx]) * inv_x_z;
-                ci += 1;
-            }
-            d = d + deep_coeffs[ci] * (q_evals[i] - q_z) * inv_x_z;
-            d
-        }).collect();
-        eprintln!("[prove] [6/8] done in {:.2?}", t.elapsed());
+        // ── Phase 4: out-of-domain ──────────────────────────────────────
+        let gamma = E::draw_ood(&mut transcript);
+        let gz = E::mask_point(gamma, 1, log_trace);
+        let van_z = E::vanishing_at_ood(log_trace, gamma);
+        let van_gz = E::vanishing_at_ood(log_trace, gz);
 
-        // ── Phase 7: FRI ─────────────────────────────────────────────
-        let t = std::time::Instant::now();
-        eprintln!("[prove] [7/8] FRI commit + folding...");
-        let mut fri_layers: Vec<Vec<Ext>> = Vec::new();
-        let mut fri_trees: Vec<MerkleTree> = Vec::new();
-        let mut fri_commitments: Vec<Hash> = Vec::new();
+        let trace_at_z = ood_base::<E>(&trace_coeffs, &trace_mask, gamma, van_z, num_cols);
+        let trace_at_gz = ood_base::<E>(&trace_coeffs, &trace_mask, gz, van_gz, num_cols);
+        let accum_at_z = ood_ext::<E>(&accum_coeffs, &accum_mask, gamma, van_z);
+        let accum_at_gz = ood_ext::<E>(&accum_coeffs, &accum_mask, gz, van_gz);
 
-        fri_layers.push(d_evals.clone());
-        let tree0 = build_scalar_merkle_tree_ext(&d_evals);
-        let root0 = tree0.root();
-        transcript.absorb_commitment(&root0);
-        fri_commitments.push(root0);
-        fri_trees.push(tree0);
-
-        let mut current = d_evals;
-        let mut xs: Vec<BabyBear> = shifted_elements.clone();
-        // Fold down to the degree-bound layer (size lde/D_BOUND). For an honest
-        // proof that layer is constant; the verifier checks that, which enforces
-        // the degree bound. The round count is fixed, not data-dependent.
-        let final_layer_size = lde_size / fri_degree_bound(trace_len);
-        while current.len() > final_layer_size {
-            let beta = draw_ext(&mut transcript);
-            let folded = fri_fold_ext(&current, &xs, beta);
-            xs.truncate(folded.len());
-            for x in &mut xs { *x = *x * *x; }
-            fri_layers.push(folded.clone());
-            let tree = build_scalar_merkle_tree_ext(&folded);
-            let root = tree.root();
-            transcript.absorb_commitment(&root);
-            fri_commitments.push(root);
-            fri_trees.push(tree);
-            current = folded;
-        }
-        let fri_final_layer = current;
-        eprintln!(
-            "[prove] [7/8] done in {:.2?} ({} layers)",
-            t.elapsed(),
-            fri_layers.len()
+        let q_z = quotient_identity::<E>(
+            log_trace, gamma, &trace_at_z, &trace_at_gz, &accum_at_z, &accum_at_gz, &cweights,
+            &gammas, &alphas, entry_pc_e, van_z, num_main, total_constraints,
         );
 
-        // ── Phase 8: queries ─────────────────────────────────────────
-        let t = std::time::Instant::now();
-        eprintln!("[prove] [8/8] building {} query proofs...", NUM_QUERIES);
-        let first_layer_half = fri_layers[0].len() / 2;
-        let query_indices = transcript.draw_indices(NUM_QUERIES, first_layer_half);
-
-        let mut query_proofs = Vec::with_capacity(NUM_QUERIES);
-        for &qi in &query_indices {
-            let idx_g = (qi + BLOWUP) % lde_size;
-
-            let trace_opening = open_row_merkle(&trace_tree, &trace_lde, qi, num_cols);
-            let trace_opening_g = open_row_merkle(&trace_tree, &trace_lde, idx_g, num_cols);
-            let accum_opening = open_row_merkle_ext(&accum_tree, &accum_lde, qi, NUM_ACCUM_COLS);
-            let accum_opening_g = open_row_merkle_ext(&accum_tree, &accum_lde, idx_g, NUM_ACCUM_COLS);
-            let quotient_opening = open_scalar_merkle_ext(&q_tree, &q_evals, qi);
-
-            let half0 = fri_layers[0].len() / 2;
-            let deep_opening = open_scalar_merkle_ext(&fri_trees[0], &fri_layers[0], qi);
-            let deep_opening_pair = open_scalar_merkle_ext(&fri_trees[0], &fri_layers[0], qi + half0);
-
-            let mut fri_openings = Vec::new();
-            let mut idx = qi;
-            for layer_idx in 1..fri_layers.len() - 1 {
-                let half = fri_layers[layer_idx].len() / 2;
-                idx = idx % half;
-                let op = open_scalar_merkle_ext(&fri_trees[layer_idx], &fri_layers[layer_idx], idx);
-                let op_pair = open_scalar_merkle_ext(&fri_trees[layer_idx], &fri_layers[layer_idx], idx + half);
-                fri_openings.push((op, op_pair));
-            }
-
-            query_proofs.push(QueryProof {
-                index: qi,
-                trace_opening, trace_opening_g,
-                accum_opening, accum_opening_g,
-                quotient_opening,
-                deep_opening, deep_opening_pair,
-                fri_openings,
-            });
+        for &v in &trace_at_z {
+            E::absorb_ext(&mut transcript, v);
         }
-        eprintln!("[prove] [8/8] done in {:.2?}", t.elapsed());
-        eprintln!("[prove] TOTAL: {:.2?}", t_total.elapsed());
+        for &v in &trace_at_gz {
+            E::absorb_ext(&mut transcript, v);
+        }
+        for &v in &accum_at_z {
+            E::absorb_ext(&mut transcript, v);
+        }
+        for &v in &accum_at_gz {
+            E::absorb_ext(&mut transcript, v);
+        }
+        E::absorb_ext(&mut transcript, q_z);
+
+        // ── Phase 5: DEEP ───────────────────────────────────────────────
+        let num_deep = 2 * num_cols + 2 * NUM_ACCUM_COLS + 1;
+        let deep: Vec<E::Ext> = (0..num_deep).map(|_| E::draw_ext(&mut transcript)).collect();
+        let inv_z = E::deep_denom_inv_over_eval(gamma, &points);
+
+        let d_evals: Vec<E::Ext> = (0..lde_size)
+            .map(|i| {
+                let next_i = E::rotation_index(log_eval, i, rotation_step);
+                let mut d = E::Ext::ZERO;
+                let mut ci = 0;
+                for c in 0..num_cols {
+                    d = d + deep[ci] * (E::Ext::from(trace_lde[c][i]) - trace_at_z[c]) * inv_z[i];
+                    ci += 1;
+                }
+                for c in 0..num_cols {
+                    d = d + deep[ci] * (E::Ext::from(trace_lde[c][next_i]) - trace_at_gz[c]) * inv_z[i];
+                    ci += 1;
+                }
+                for c in 0..NUM_ACCUM_COLS {
+                    d = d + deep[ci] * (accum_lde[c][i] - accum_at_z[c]) * inv_z[i];
+                    ci += 1;
+                }
+                for c in 0..NUM_ACCUM_COLS {
+                    d = d + deep[ci] * (accum_lde[c][next_i] - accum_at_gz[c]) * inv_z[i];
+                    ci += 1;
+                }
+                d + deep[ci] * (q_evals[i] - q_z) * inv_z[i]
+            })
+            .collect();
+
+        // ── Phase 6: FRI + queries ──────────────────────────────────────
+        let fri_prover = E::fri_commit(&mut transcript, d_evals, log_eval, log_bound, &eval_tf);
+        let half = lde_size / 2;
+        let query_indices = transcript.draw_indices(NUM_QUERIES, half);
+
+        let queries: Vec<QueryProof<E>> = query_indices
+            .iter()
+            .map(|&qi| {
+                let positions = [
+                    qi,
+                    E::rotation_index(log_eval, qi, rotation_step),
+                    qi + half,
+                    E::rotation_index(log_eval, qi + half, rotation_step),
+                ];
+                QueryProof {
+                    trace: positions
+                        .iter()
+                        .map(|&p| open_row::<E::Base>(&trace_tree, &trace_lde, &trace_salts, p))
+                        .collect(),
+                    accum: positions
+                        .iter()
+                        .map(|&p| open_row::<E::Ext>(&accum_tree, &accum_lde, &accum_salts, p))
+                        .collect(),
+                    quotient: [qi, qi + half]
+                        .iter()
+                        .map(|&p| open_scalar::<E::Ext>(&q_tree, &q_evals, &q_salts, p))
+                        .collect(),
+                }
+            })
+            .collect();
+
+        let fri = E::fri_into_proof(fri_prover, &query_indices);
 
         ZkvmProof {
-            trace_len, lde_size, num_cols,
+            trace_len,
+            num_cols,
             num_accum_cols: NUM_ACCUM_COLS,
-            trace_commitment, accum_commitment, quotient_commitment,
-            trace_at_z, trace_at_gz, accum_at_z, accum_at_gz, q_z,
-            gammas, alphas,
-            fri_commitments, fri_final_layer, query_proofs,
+            trace_root,
+            accum_root,
+            quotient_root,
+            trace_at_z,
+            trace_at_gz,
+            accum_at_z,
+            accum_at_gz,
+            q_z,
+            gammas,
+            alphas,
+            fri,
+            queries,
             program_hash: self.program_hash,
             public_inputs: self.public_inputs.clone(),
             public_outputs: self.public_outputs.clone(),
@@ -568,69 +437,169 @@ impl ZkvmProver {
     }
 }
 
-// ── helpers ───────────────────────────────────────────────────────────
-
-fn build_trace_view(trace_lde: &[Vec<BabyBear>], row: usize) -> TraceView<Ext> {
-    // Lift the base-field trace row into the extension field for constraint
-    // evaluation (base embeds as a + 0X + 0X^2 + 0X^3).
-    TraceView::<Ext> { vals: trace_lde.iter().map(|c| Ext::from(c[row])).collect() }
+/// OOD evaluation of a masked base column set: `coeffs(pt) + van·mask(pt)`.
+fn ood_base<E: Engine>(
+    coeffs: &[Vec<E::Base>],
+    mask: &[Vec<E::Base>],
+    pt: E::Ood,
+    van: E::Ext,
+    num_cols: usize,
+) -> Vec<E::Ext> {
+    (0..num_cols)
+        .map(|c| {
+            let mut v = E::eval_at_ood(&coeffs[c], pt);
+            if !mask[c].is_empty() {
+                v = v + van * E::eval_at_ood(&mask[c], pt);
+            }
+            v
+        })
+        .collect()
 }
 
-fn build_row_merkle_tree(cols: &[Vec<BabyBear>], lde_size: usize) -> MerkleTree {
-    let num_cols = cols.len();
-    let leaves: Vec<Vec<u8>> = (0..lde_size).map(|i| {
-        let mut h = Sha256::new();
-        for col in 0..num_cols {
-            h.update(cols[col][i].to_bytes());
-        }
-        h.finalize().to_vec()
-    }).collect();
+fn ood_ext<E: Engine>(
+    coeffs: &[Vec<E::Ext>],
+    mask: &[Vec<E::Ext>],
+    pt: E::Ood,
+    van: E::Ext,
+) -> Vec<E::Ext> {
+    (0..NUM_ACCUM_COLS)
+        .map(|c| E::eval_ext_at_ood(&coeffs[c], pt) + van * E::eval_ext_at_ood(&mask[c], pt))
+        .collect()
+}
+
+/// The combined constraint quotient at the out-of-domain point, from the
+/// claimed mask values — the verifier's identity and the prover's `q(gamma)`.
+#[allow(clippy::too_many_arguments)]
+pub fn quotient_identity<E: Engine>(
+    log_trace: u32,
+    gamma: E::Ood,
+    trace_at_z: &[E::Ext],
+    trace_at_gz: &[E::Ext],
+    accum_at_z: &[E::Ext],
+    accum_at_gz: &[E::Ext],
+    cweights: &[E::Ext],
+    gammas: &[E::Ext; 4],
+    alphas: &[E::Ext; 4],
+    entry_pc_e: E::Ext,
+    van_z: E::Ext,
+    num_main: usize,
+    total_constraints: usize,
+) -> E::Ext {
+    let trace_len = 1usize << log_trace;
+    let curr = TraceView::<E::Ext> { vals: trace_at_z.to_vec() };
+    let next = TraceView::<E::Ext> { vals: trace_at_gz.to_vec() };
+    let main_cv = eval_transition_constraints(&curr, &next);
+    let accum_cv =
+        permutation::eval_accum_constraints(&curr, &next, accum_at_z, accum_at_gz, gammas, alphas);
+
+    let mut c_excepted = E::Ext::ZERO;
+    for (j, &v) in main_cv.iter().enumerate() {
+        c_excepted = c_excepted + cweights[j] * v;
+    }
+    let mut c_wrap = E::Ext::ZERO;
+    for (j, &v) in accum_cv.iter().enumerate() {
+        c_wrap = c_wrap + cweights[num_main + j] * v;
+    }
+    let p_last = E::trace_point(log_trace, trace_len - 1);
+    let p_first = E::trace_point(log_trace, 0);
+    let excl_z = E::point_vanishing_at_ood(p_last, gamma);
+    let transition_q = (c_excepted * excl_z + c_wrap) * van_z.inverse();
+
+    let one = E::Ext::ONE;
+    let alpha_b = total_constraints;
+    let mut b_first = E::Ext::ZERO;
+    b_first = b_first + cweights[alpha_b] * trace_at_z[col::CLK];
+    b_first = b_first + cweights[alpha_b + 1] * (trace_at_z[col::PC] - entry_pc_e);
+    b_first = b_first + cweights[alpha_b + 2] * trace_at_z[col::HALT];
+    b_first = b_first + cweights[alpha_b + 3] * trace_at_z[col::I_IN];
+    b_first = b_first + cweights[alpha_b + 4] * trace_at_z[col::I_OUT];
+    for ch in 0..NUM_CHANNELS {
+        b_first = b_first + cweights[alpha_b + 5 + ch] * (accum_at_z[accum::REG + ch] - one);
+        b_first = b_first + cweights[alpha_b + 5 + NUM_CHANNELS + ch] * (accum_at_z[accum::MEM + ch] - one);
+        b_first = b_first + cweights[alpha_b + 5 + 2 * NUM_CHANNELS + ch] * accum_at_z[accum::PROG + ch];
+        b_first = b_first + cweights[alpha_b + 5 + 3 * NUM_CHANNELS + ch] * accum_at_z[accum::PUB_IN + ch];
+        b_first = b_first + cweights[alpha_b + 5 + 4 * NUM_CHANNELS + ch] * accum_at_z[accum::PUB_OUT + ch];
+    }
+    let rom_b = total_constraints + 5 + 5 * NUM_CHANNELS;
+    b_first = b_first + cweights[rom_b] * trace_at_z[col::PROG];
+    let smem_init = trace_at_z[col::SMEM + 4] * (one - trace_at_z[col::SMEM + 3]) * trace_at_z[col::SMEM + 1];
+    b_first = b_first + cweights[rom_b + 1] * smem_init;
+    let b_first_q = b_first * E::boundary_denom_inv_at_ood(p_first, gamma);
+
+    let alpha_l = total_constraints + num_b_first();
+    let b_last = cweights[alpha_l] * (trace_at_z[col::HALT] - one);
+    let b_last_q = b_last * E::boundary_denom_inv_at_ood(p_last, gamma);
+
+    transition_q + b_first_q + b_last_q
+}
+
+// ── row / scalar commitments ──────────────────────────────────────────
+// Each row/scalar leaf is `SHA256(cell bytes || salt)`; the salt hides the
+// small base-field cell values that an opening would otherwise reveal.
+
+fn build_trace_view<E: Engine>(trace_lde: &[Vec<E::Base>], row: usize) -> TraceView<E::Ext> {
+    TraceView {
+        vals: trace_lde.iter().map(|c| E::Ext::from(c[row])).collect(),
+    }
+}
+
+fn salts(count: usize, rng: &mut impl Rng) -> Vec<[u8; SALT_LEN]> {
+    (0..count).map(|_| rng.r#gen::<[u8; SALT_LEN]>()).collect()
+}
+
+pub fn row_digest<F: Field>(values: &[F], salt: &[u8]) -> Vec<u8> {
+    let mut h = Sha256::new();
+    for v in values {
+        h.update(v.to_bytes());
+    }
+    h.update(salt);
+    h.finalize().to_vec()
+}
+
+pub fn scalar_digest<F: Field>(value: F, salt: &[u8]) -> Vec<u8> {
+    let mut h = Sha256::new();
+    h.update(value.to_bytes());
+    h.update(salt);
+    h.finalize().to_vec()
+}
+
+fn commit_rows<F: Field>(cols: &[Vec<F>], salts: &[[u8; SALT_LEN]]) -> MerkleTree {
+    let n = cols[0].len();
+    let leaves: Vec<Vec<u8>> = (0..n)
+        .map(|i| row_digest(&cols.iter().map(|c| c[i]).collect::<Vec<_>>(), &salts[i]))
+        .collect();
     MerkleTree::new(&leaves)
 }
 
-fn build_row_merkle_tree_ext(cols: &[Vec<Ext>], lde_size: usize) -> MerkleTree {
-    let num_cols = cols.len();
-    let leaves: Vec<Vec<u8>> = (0..lde_size).map(|i| {
-        let mut h = Sha256::new();
-        for col in 0..num_cols {
-            h.update(cols[col][i].to_bytes());
-        }
-        h.finalize().to_vec()
-    }).collect();
+fn commit_scalars<F: Field>(evals: &[F], salts: &[[u8; SALT_LEN]]) -> MerkleTree {
+    let leaves: Vec<Vec<u8>> = (0..evals.len())
+        .map(|i| scalar_digest(evals[i], &salts[i]))
+        .collect();
     MerkleTree::new(&leaves)
 }
 
-fn build_scalar_merkle_tree_ext(evals: &[Ext]) -> MerkleTree {
-    let leaves: Vec<Vec<u8>> = evals.iter().map(|v| v.to_bytes().to_vec()).collect();
-    MerkleTree::new(&leaves)
+fn open_row<F: Field>(
+    tree: &MerkleTree,
+    cols: &[Vec<F>],
+    salts: &[[u8; SALT_LEN]],
+    index: usize,
+) -> RowOpening<F> {
+    RowOpening {
+        values: cols.iter().map(|c| c[index]).collect(),
+        salt: salts[index],
+        path: tree.prove(index),
+    }
 }
 
-fn open_row_merkle(tree: &MerkleTree, cols: &[Vec<BabyBear>], index: usize, num_cols: usize) -> MerkleOpening {
-    let path = tree.prove(index);
-    let values: Vec<BabyBear> = (0..num_cols).map(|c| cols[c][index]).collect();
-    MerkleOpening { index, values, path }
-}
-
-fn open_row_merkle_ext(tree: &MerkleTree, cols: &[Vec<Ext>], index: usize, num_cols: usize) -> MerkleOpeningExt {
-    let path = tree.prove(index);
-    let values: Vec<Ext> = (0..num_cols).map(|c| cols[c][index]).collect();
-    MerkleOpeningExt { index, values, path }
-}
-
-fn open_scalar_merkle_ext(tree: &MerkleTree, evals: &[Ext], index: usize) -> ScalarOpening {
-    let path = tree.prove(index);
-    ScalarOpening { index, value: evals[index], path }
-}
-
-/// Derive the out-of-domain point in the extension field. A random extension
-/// element is outside the base evaluation domain unless it happens to be a base
-/// element (negligible), so we only need to reject the base case to guarantee
-/// z, g·z ∉ domain (keeping the DEEP denominators invertible).
-fn derive_z(transcript: &mut Transcript) -> Ext {
-    loop {
-        let z = draw_ext(transcript);
-        if !z.is_base() {
-            return z;
-        }
+fn open_scalar<F: Field>(
+    tree: &MerkleTree,
+    evals: &[F],
+    salts: &[[u8; SALT_LEN]],
+    index: usize,
+) -> ScalarOpening<F> {
+    ScalarOpening {
+        value: evals[index],
+        salt: salts[index],
+        path: tree.prove(index),
     }
 }

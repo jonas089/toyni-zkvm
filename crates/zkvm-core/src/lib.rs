@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use toyni::field::BabyBear;
+use toyni::field::Field;
 
 // ── Opcodes ────────────────────────────────────────────────────────────
 
@@ -72,21 +72,28 @@ pub struct Instruction {
 
 // ── BabyBear-on-u32 helpers (so the runtime never overflows) ───────────
 
+/// Default VM field prime (BabyBear). The circle engine uses M31's prime;
+/// the prime is threaded into `run` so the field-native VM computes in the
+/// engine's base field.
 pub const P: u32 = 2_013_265_921;
+pub const P_M31: u32 = 2_147_483_647;
+
+/// Build a base-field element from a small integer (the VM's canonical rep).
+#[inline]
+fn f<B: Field>(v: u32) -> B { B::from_u64(v as u64) }
 
 #[inline]
-fn bb_add(a: u32, b: u32) -> u32 {
+fn bb_add(a: u32, b: u32, p: u32) -> u32 {
     let s = a as u64 + b as u64;
-    let p = P as u64;
-    if s >= p { (s - p) as u32 } else { s as u32 }
+    if s >= p as u64 { (s - p as u64) as u32 } else { s as u32 }
 }
 #[inline]
-fn bb_sub(a: u32, b: u32) -> u32 {
-    if a >= b { a - b } else { a + P - b }
+fn bb_sub(a: u32, b: u32, p: u32) -> u32 {
+    if a >= b { a - b } else { a + p - b }
 }
 #[inline]
-fn bb_mul(a: u32, b: u32) -> u32 {
-    ((a as u64 * b as u64) % P as u64) as u32
+fn bb_mul(a: u32, b: u32, p: u32) -> u32 {
+    ((a as u64 * b as u64) % p as u64) as u32
 }
 
 // ── Execution ─────────────────────────────────────────────────────────
@@ -136,6 +143,7 @@ pub fn run(
     program: &[Instruction],
     public_inputs: &[u32],
     max_steps: usize,
+    p: u32,
 ) -> Result<(Vec<StepRecord>, Vec<u32>), String> {
     let mut s = VmState::new();
     let mut trace = Vec::new();
@@ -164,9 +172,9 @@ pub fn run(
                 let va = read(ra, &s.regs);
                 let vb = read(rb, &s.regs);
                 let vd = match instr.op {
-                    Opcode::Add => bb_add(va, vb),
-                    Opcode::Sub => bb_sub(va, vb),
-                    Opcode::Mul => bb_mul(va, vb),
+                    Opcode::Add => bb_add(va, vb, p),
+                    Opcode::Sub => bb_sub(va, vb, p),
+                    Opcode::Mul => bb_mul(va, vb, p),
                     _ => unreachable!(),
                 };
                 write(rd, vd, &mut s.regs);
@@ -361,18 +369,18 @@ pub mod accum {
 
 // ── Trace builder ─────────────────────────────────────────────────────
 
-pub fn build_columns(
+pub fn build_columns<B: Field>(
     records: &[StepRecord],
     program: &[Instruction],
     public_inputs: &[u32],
     public_outputs: &[u32],
-) -> (Vec<Vec<BabyBear>>, usize) {
+) -> (Vec<Vec<B>>, usize) {
     let n_real = records.len();
     assert!(n_real > 0, "trace cannot be empty");
     assert!(records.last().unwrap().instr.op == Opcode::Halt, "last real row must be HALT");
 
     let n = n_real.next_power_of_two().max(1 << 8);
-    let mut cols: Vec<Vec<BabyBear>> = vec![vec![BabyBear::zero(); n]; NUM_TRACE_COLS];
+    let mut cols: Vec<Vec<B>> = vec![vec![B::ZERO; n]; NUM_TRACE_COLS];
 
     let last = &records[n_real - 1];
 
@@ -446,112 +454,112 @@ pub fn build_columns(
         if i >= n { break; }
         let addr = i as u32;
         let m = mult.remove(&addr).unwrap_or(0);
-        cols[col::PROG    ][i] = BabyBear::from_u32(addr);
-        cols[col::PROG + 1][i] = BabyBear::from_u32(ins.op as u32);
-        cols[col::PROG + 2][i] = BabyBear::from_u32(ins.a);
-        cols[col::PROG + 3][i] = BabyBear::from_u32(ins.b);
-        cols[col::PROG + 4][i] = BabyBear::from_u32(ins.c);
-        cols[col::PROG + 5][i] = BabyBear::from_u32(m);
-        cols[col::PROG + 6][i] = BabyBear::one(); // real ROM row
+        cols[col::PROG    ][i] = f::<B>(addr);
+        cols[col::PROG + 1][i] = f::<B>(ins.op as u32);
+        cols[col::PROG + 2][i] = f::<B>(ins.a);
+        cols[col::PROG + 3][i] = f::<B>(ins.b);
+        cols[col::PROG + 4][i] = f::<B>(ins.c);
+        cols[col::PROG + 5][i] = f::<B>(m);
+        cols[col::PROG + 6][i] = B::ONE; // real ROM row
         // Range-check the multiplicity (ROM_MULT_RANGE): m < 2^DIFF_BITS.
         for k in 0..col::DIFF_BITS {
-            cols[col::MULT_BITS_PROG + k][i] = BabyBear::from_u32((m >> k) & 1);
+            cols[col::MULT_BITS_PROG + k][i] = f::<B>((m >> k) & 1);
         }
     }
     // Any leftover multiplicities (shouldn't happen for honest provers) are dropped.
 
     for (j, &v) in public_inputs.iter().enumerate() {
         if j >= n { break; }
-        cols[col::PUB_IN    ][j] = BabyBear::from_u32(j as u32);
-        cols[col::PUB_IN + 1][j] = BabyBear::from_u32(v);
-        cols[col::PUB_IN + 2][j] = BabyBear::one();
+        cols[col::PUB_IN    ][j] = f::<B>(j as u32);
+        cols[col::PUB_IN + 1][j] = f::<B>(v);
+        cols[col::PUB_IN + 2][j] = B::ONE;
     }
     for (j, &v) in public_outputs.iter().enumerate() {
         if j >= n { break; }
-        cols[col::PUB_OUT    ][j] = BabyBear::from_u32(j as u32);
-        cols[col::PUB_OUT + 1][j] = BabyBear::from_u32(v);
-        cols[col::PUB_OUT + 2][j] = BabyBear::one();
+        cols[col::PUB_OUT    ][j] = f::<B>(j as u32);
+        cols[col::PUB_OUT + 1][j] = f::<B>(v);
+        cols[col::PUB_OUT + 2][j] = B::ONE;
     }
 
     fill_aux(&mut cols);
     (cols, n_real)
 }
 
-fn write_main(cols: &mut [Vec<BabyBear>], i: usize, r: &StepRecord) {
-    cols[col::CLK    ][i] = BabyBear::from_u32(r.clk);
-    cols[col::PC     ][i] = BabyBear::from_u32(r.pc);
-    cols[col::NEXT_PC][i] = BabyBear::from_u32(r.next_pc);
-    cols[col::OPCODE ][i] = BabyBear::from_u32(r.instr.op as u32);
-    cols[col::OP_A   ][i] = BabyBear::from_u32(r.instr.a);
-    cols[col::OP_B   ][i] = BabyBear::from_u32(r.instr.b);
-    cols[col::OP_C   ][i] = BabyBear::from_u32(r.instr.c);
-    cols[col::HALT   ][i] = BabyBear::from_u32(r.halt_post);
-    cols[col::I_IN   ][i] = BabyBear::from_u32(r.i_in_pre);
-    cols[col::I_OUT  ][i] = BabyBear::from_u32(r.i_out_pre);
+fn write_main<B: Field>(cols: &mut [Vec<B>], i: usize, r: &StepRecord) {
+    cols[col::CLK    ][i] = f::<B>(r.clk);
+    cols[col::PC     ][i] = f::<B>(r.pc);
+    cols[col::NEXT_PC][i] = f::<B>(r.next_pc);
+    cols[col::OPCODE ][i] = f::<B>(r.instr.op as u32);
+    cols[col::OP_A   ][i] = f::<B>(r.instr.a);
+    cols[col::OP_B   ][i] = f::<B>(r.instr.b);
+    cols[col::OP_C   ][i] = f::<B>(r.instr.c);
+    cols[col::HALT   ][i] = f::<B>(r.halt_post);
+    cols[col::I_IN   ][i] = f::<B>(r.i_in_pre);
+    cols[col::I_OUT  ][i] = f::<B>(r.i_out_pre);
 
     let bases = [col::REG_A_IDX, col::REG_B_IDX, col::REG_C_IDX];
     let active = r.instr.op.slot_active();
     for (k, &(idx, val, wr)) in r.reg.iter().enumerate() {
-        cols[bases[k]    ][i] = BabyBear::from_u32(idx);
-        cols[bases[k] + 1][i] = BabyBear::from_u32(val);
-        cols[bases[k] + 2][i] = BabyBear::from_u32(wr);
+        cols[bases[k]    ][i] = f::<B>(idx);
+        cols[bases[k] + 1][i] = f::<B>(val);
+        cols[bases[k] + 2][i] = f::<B>(wr);
         // INV column: idx == 0 ? 0 : idx^-1
         if idx == 0 {
-            cols[bases[k] + 3][i] = BabyBear::zero();
+            cols[bases[k] + 3][i] = B::ZERO;
         } else {
-            cols[bases[k] + 3][i] = BabyBear::from_u32(idx).inverse();
+            cols[bases[k] + 3][i] = f::<B>(idx).inverse();
         }
         // ACTIVE column.
-        cols[bases[k] + 4][i] = BabyBear::from_u32(active[k] as u32);
+        cols[bases[k] + 4][i] = f::<B>(active[k] as u32);
     }
 
     let (m_addr, m_val, m_wr, m_used) = r.mem;
-    cols[col::MEM_ADDR][i] = BabyBear::from_u32(m_addr);
-    cols[col::MEM_VAL ][i] = BabyBear::from_u32(m_val);
-    cols[col::MEM_WR  ][i] = BabyBear::from_u32(m_wr);
-    cols[col::MEM_USED][i] = BabyBear::from_u32(m_used);
+    cols[col::MEM_ADDR][i] = f::<B>(m_addr);
+    cols[col::MEM_VAL ][i] = f::<B>(m_val);
+    cols[col::MEM_WR  ][i] = f::<B>(m_wr);
+    cols[col::MEM_USED][i] = f::<B>(m_used);
 
     // JZ helpers (only meaningful when sel_jz=1, but always written so the
     // constraints are well-defined on every row).
     let ra_val = r.reg[0].1;
     if ra_val == 0 {
-        cols[col::JZ_IS_ZERO][i] = BabyBear::one();
-        cols[col::JZ_VAL_INV][i] = BabyBear::zero();
+        cols[col::JZ_IS_ZERO][i] = B::ONE;
+        cols[col::JZ_VAL_INV][i] = B::ZERO;
     } else {
-        cols[col::JZ_IS_ZERO][i] = BabyBear::zero();
-        cols[col::JZ_VAL_INV][i] = BabyBear::from_u32(ra_val).inverse();
+        cols[col::JZ_IS_ZERO][i] = B::ZERO;
+        cols[col::JZ_VAL_INV][i] = f::<B>(ra_val).inverse();
     }
 
-    cols[col::SEL_START + r.instr.op.sel_index()][i] = BabyBear::one();
+    cols[col::SEL_START + r.instr.op.sel_index()][i] = B::ONE;
 }
 
-fn write_sreg(cols: &mut [Vec<BabyBear>], i: usize, chunk: &[(u32, u32, u32, u32)]) {
+fn write_sreg<B: Field>(cols: &mut [Vec<B>], i: usize, chunk: &[(u32, u32, u32, u32)]) {
     let bases = [col::SREG_A, col::SREG_B, col::SREG_C];
     for k in 0..3 {
         let (idx, val, t, wr) = if k < chunk.len() { chunk[k] } else { (0, 0, 0, 0) };
-        cols[bases[k]    ][i] = BabyBear::from_u32(idx);
-        cols[bases[k] + 1][i] = BabyBear::from_u32(val);
-        cols[bases[k] + 2][i] = BabyBear::from_u32(t);
-        cols[bases[k] + 3][i] = BabyBear::from_u32(wr);
+        cols[bases[k]    ][i] = f::<B>(idx);
+        cols[bases[k] + 1][i] = f::<B>(val);
+        cols[bases[k] + 2][i] = f::<B>(t);
+        cols[bases[k] + 3][i] = f::<B>(wr);
         // idx_inv for SORTED_R0_PIN: idx == 0 ? 0 : idx^-1.
         cols[bases[k] + 4][i] = if idx == 0 {
-            BabyBear::zero()
+            B::ZERO
         } else {
-            BabyBear::from_u32(idx).inverse()
+            f::<B>(idx).inverse()
         };
     }
 }
 
-fn write_smem(cols: &mut [Vec<BabyBear>], i: usize, e: (u32, u32, u32, u32, u32)) {
+fn write_smem<B: Field>(cols: &mut [Vec<B>], i: usize, e: (u32, u32, u32, u32, u32)) {
     let (addr, val, clk, wr, used) = e;
-    cols[col::SMEM    ][i] = BabyBear::from_u32(addr);
-    cols[col::SMEM + 1][i] = BabyBear::from_u32(val);
-    cols[col::SMEM + 2][i] = BabyBear::from_u32(clk);
-    cols[col::SMEM + 3][i] = BabyBear::from_u32(wr);
-    cols[col::SMEM + 4][i] = BabyBear::from_u32(used);
+    cols[col::SMEM    ][i] = f::<B>(addr);
+    cols[col::SMEM + 1][i] = f::<B>(val);
+    cols[col::SMEM + 2][i] = f::<B>(clk);
+    cols[col::SMEM + 3][i] = f::<B>(wr);
+    cols[col::SMEM + 4][i] = f::<B>(used);
 }
 
-fn fill_aux(cols: &mut [Vec<BabyBear>]) {
+fn fill_aux<B: Field>(cols: &mut [Vec<B>]) {
     let n = cols[0].len();
 
     // Sorted-reg cross-slot aux + diff bit decomposition.
@@ -587,8 +595,8 @@ fn fill_aux(cols: &mut [Vec<BabyBear>]) {
 }
 
 /// Fill same_idx + diff_inv aux for a register slot transition WITHIN the same row.
-fn fill_sort_aux_reg(
-    cols: &mut [Vec<BabyBear>],
+fn fill_sort_aux_reg<B: Field>(
+    cols: &mut [Vec<B>],
     i: usize,
     prev_base: usize,
     next_base: usize,
@@ -612,23 +620,23 @@ fn fill_sort_aux_reg(
 /// shape (it's "negative") so we leave the bits at zero. The AIR marks the
 /// range-check constraint as a main transition so it's excepted at the
 /// last row.
-fn fill_sort_aux_with_clks(
-    cols: &mut [Vec<BabyBear>],
+fn fill_sort_aux_with_clks<B: Field>(
+    cols: &mut [Vec<B>],
     i: usize,
     aux_base: usize,
     bits_base: usize,
-    prev_idx: BabyBear,
-    prev_clk: BabyBear,
-    next_idx: BabyBear,
-    next_clk: BabyBear,
+    prev_idx: B,
+    prev_clk: B,
+    next_idx: B,
+    next_clk: B,
     is_in_trace: bool,
 ) {
     let same = prev_idx == next_idx;
     if same {
-        cols[aux_base    ][i] = BabyBear::one();
-        cols[aux_base + 1][i] = BabyBear::zero();
+        cols[aux_base    ][i] = B::ONE;
+        cols[aux_base + 1][i] = B::ZERO;
     } else {
-        cols[aux_base    ][i] = BabyBear::zero();
+        cols[aux_base    ][i] = B::ZERO;
         cols[aux_base + 1][i] = (next_idx - prev_idx).inverse();
     }
 
@@ -644,17 +652,17 @@ fn fill_sort_aux_with_clks(
     // reversed ordering yields diff ≈ 2^31 in the field, far exceeding the
     // bit budget, so the recon constraint catches it.
     let v = if same {
-        let nc = next_clk.value as i64;
-        let pc = prev_clk.value as i64;
+        let nc = next_clk.to_canonical_u64() as i64;
+        let pc = prev_clk.to_canonical_u64() as i64;
         (nc - pc - 1) as u64
     } else {
-        let ni = next_idx.value as i64;
-        let pi = prev_idx.value as i64;
+        let ni = next_idx.to_canonical_u64() as i64;
+        let pi = prev_idx.to_canonical_u64() as i64;
         (ni - pi - 1) as u64
     };
     for k in 0..col::DIFF_BITS {
         let bit = ((v >> k) & 1) as u32;
-        cols[bits_base + k][i] = BabyBear::from_u32(bit);
+        cols[bits_base + k][i] = f::<B>(bit);
     }
 }
 

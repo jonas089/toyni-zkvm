@@ -10,6 +10,7 @@ use std::env;
 use std::fs;
 use std::process;
 
+use toyni::field::BabyBear;
 use zkvm_core::{build_columns, hash_program, run, Instruction};
 use zkvm_prover::ZkvmProver;
 use zkvm_verifier::ZkvmVerifier;
@@ -71,13 +72,13 @@ fn cmd_prove(args: &[String]) {
     eprintln!("[cli] program: {} instructions", program.len());
 
     let max_steps = 1usize << 20;
-    let (records, outputs) = match run(&program, &public_inputs, max_steps) {
+    let (records, outputs) = match run(&program, &public_inputs, max_steps, zkvm_core::P) {
         Ok(r) => r,
         Err(e) => { eprintln!("run error: {}", e); process::exit(1); }
     };
     eprintln!("[cli] executed {} cycles, outputs={:?}", records.len(), outputs);
 
-    let (columns, _n_real) = build_columns(&records, &program, &public_inputs, &outputs);
+    let (columns, _n_real) = build_columns::<BabyBear>(&records, &program, &public_inputs, &outputs);
     let program_hash = hash_program(&program);
     let program_rom: Vec<(u32, u32, u32, u32, u32)> = program.iter().enumerate()
         .map(|(i, ins)| (i as u32, ins.op as u32, ins.a, ins.b, ins.c))

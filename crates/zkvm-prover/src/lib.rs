@@ -240,7 +240,7 @@ impl ZkvmProver {
         transcript.absorb_commitment(&accum_commitment);
 
         // ── Phase 3: combined constraint quotient ────────────────────
-        let num_main = num_transition_constraints();
+        let num_main = num_transition_constraints::<Ext>();
         let num_accum = permutation::num_accum_constraints();
         let total_constraints = num_main + num_accum;
         // Boundary first-row: 5 state cells (CLK, PC, HALT, I_IN, I_OUT)
@@ -365,8 +365,8 @@ impl ZkvmProver {
         let q_z = z.eval_ext_at_ext(&q_coeffs);
 
         // Reconstruct q(z) and verify it matches.
-        let curr_z = TraceView { vals: trace_at_z.clone() };
-        let next_gz = TraceView { vals: trace_at_gz.clone() };
+        let curr_z = TraceView::<Ext> { vals: trace_at_z.clone() };
+        let next_gz = TraceView::<Ext> { vals: trace_at_gz.clone() };
         let main_cv = eval_transition_constraints(&curr_z, &next_gz);
         let accum_cv = permutation::eval_accum_constraints(
             &curr_z, &next_gz, &accum_at_z, &accum_at_gz, &gammas, &alphas,
@@ -570,10 +570,10 @@ impl ZkvmProver {
 
 // ── helpers ───────────────────────────────────────────────────────────
 
-fn build_trace_view(trace_lde: &[Vec<BabyBear>], row: usize) -> TraceView {
+fn build_trace_view(trace_lde: &[Vec<BabyBear>], row: usize) -> TraceView<Ext> {
     // Lift the base-field trace row into the extension field for constraint
     // evaluation (base embeds as a + 0X + 0X^2 + 0X^3).
-    TraceView { vals: trace_lde.iter().map(|c| Ext::from(c[row])).collect() }
+    TraceView::<Ext> { vals: trace_lde.iter().map(|c| Ext::from(c[row])).collect() }
 }
 
 fn build_row_merkle_tree(cols: &[Vec<BabyBear>], lde_size: usize) -> MerkleTree {

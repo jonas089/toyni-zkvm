@@ -35,24 +35,27 @@
 //! the random challenges from `Ext` is what lifts the lookup / permutation and
 //! FRI soundness from ~31 bits (base field) to ~124 bits.
 
-use toyni::field::BabyBear;
+use toyni::field::{BabyBear, ExtField, Field};
 use toyni::field::BabyBearExt as Ext;
+
+/// Extension-field element from a small integer (constant helper).
+pub(crate) fn xf<X: Field>(v: u32) -> X { X::from_u64(v as u64) }
 
 use zkvm_core::{accum, col, NUM_ACCUM_COLS, NUM_CHANNELS, NUM_OPCODES, NUM_TRACE_COLS};
 
 /// A single trace row lifted into the extension field.
 #[derive(Clone)]
-pub struct TraceView {
-    pub vals: Vec<Ext>,
+pub struct TraceView<X: Field> {
+    pub vals: Vec<X>,
 }
 
-impl TraceView {
-    pub fn col(&self, i: usize) -> Ext { self.vals[i] }
-    pub fn sel(&self, k: usize) -> Ext { self.vals[col::SEL_START + k] }
+impl<X: Field> TraceView<X> {
+    pub fn col(&self, i: usize) -> X { self.vals[i] }
+    pub fn sel(&self, k: usize) -> X { self.vals[col::SEL_START + k] }
 
     /// Lift a base-field trace row into the extension field.
-    pub fn from_base(vals: &[BabyBear]) -> Self {
-        TraceView { vals: vals.iter().map(|&v| Ext::from(v)).collect() }
+    pub fn from_base<B: Field>(vals: &[B]) -> Self where X: From<B> {
+        TraceView { vals: vals.iter().map(|&v| X::from(v)).collect() }
     }
 }
 
@@ -79,9 +82,9 @@ const REG_SLOTS: [(usize, usize, usize, usize, usize); 3] = [
 
 // ── transition constraints ─────────────────────────────────────────────
 
-pub fn eval_transition_constraints(curr: &TraceView, next: &TraceView) -> Vec<Ext> {
+pub fn eval_transition_constraints<X: Field>(curr: &TraceView<X>, next: &TraceView<X>) -> Vec<X> {
     let mut c = Vec::new();
-    let one = Ext::one();
+    let one = X::ONE;
 
     // CLK_INCREMENT: clock advances by 1 (CLK_INIT is a boundary constraint).
     c.push(next.col(col::CLK) - curr.col(col::CLK) - one);
@@ -98,14 +101,14 @@ pub fn eval_transition_constraints(curr: &TraceView, next: &TraceView) -> Vec<Ex
     }
 
     // SEL_SUM_ONE.
-    let mut sum = Ext::zero();
+    let mut sum = X::ZERO;
     for k in 0..NUM_OPCODES { sum = sum + curr.sel(k); }
     c.push(sum - one);
 
     // OPCODE_RECON: OPCODE = Σ (k+1)·sel_k.
-    let mut op_recon = Ext::zero();
+    let mut op_recon = X::ZERO;
     for k in 0..NUM_OPCODES {
-        op_recon = op_recon + curr.sel(k) * Ext::from_u32((k as u32) + 1);
+        op_recon = op_recon + curr.sel(k) * xf::<X>((k as u32) + 1);
     }
     c.push(curr.col(col::OPCODE) - op_recon);
 
@@ -206,9 +209,9 @@ pub fn eval_transition_constraints(curr: &TraceView, next: &TraceView) -> Vec<Ex
 /// Program-ROM table well-formedness. The table columns are also Lagrange-bound
 /// by the verifier (which fixes addr = row index for every real entry); these
 /// in-AIR constraints are the matching in-circuit checks.
-fn rom_constraints(curr: &TraceView, next: &TraceView) -> Vec<Ext> {
+fn rom_constraints<X: Field>(curr: &TraceView<X>, next: &TraceView<X>) -> Vec<X> {
     let mut c = Vec::new();
-    let one = Ext::one();
+    let one = X::ONE;
 
     let real = curr.col(col::PROG + 6);
     let next_real = next.col(col::PROG + 6);
@@ -225,11 +228,11 @@ fn rom_constraints(curr: &TraceView, next: &TraceView) -> Vec<Ext> {
 
     // ROM_MULT_RANGE: the multiplicity is a DIFF_BITS-bit non-negative value.
     let mult = curr.col(col::PROG + 5);
-    let mut recon = Ext::zero();
+    let mut recon = X::ZERO;
     for k in 0..col::DIFF_BITS {
         let bit = curr.col(col::MULT_BITS_PROG + k);
         c.push(bit * (bit - one));
-        recon = recon + bit * Ext::from_u32(1u32 << k);
+        recon = recon + bit * xf::<X>(1u32 << k);
     }
     c.push(mult - recon);
 
@@ -238,16 +241,16 @@ fn rom_constraints(curr: &TraceView, next: &TraceView) -> Vec<Ext> {
 
 /// Constraint pack for a sorted register-slot transition (prev → next).
 /// `prev_view` and `next_view` differ only for the cross-row C → A[i+1] case.
-fn reg_slot_transition(
-    prev_view: &TraceView,
-    next_view: &TraceView,
+fn reg_slot_transition<X: Field>(
+    prev_view: &TraceView<X>,
+    next_view: &TraceView<X>,
     prev_base: usize,
     next_base: usize,
     aux_base: usize,
     bits_base: usize,
-) -> Vec<Ext> {
+) -> Vec<X> {
     let mut c = Vec::new();
-    let one = Ext::one();
+    let one = X::ONE;
 
     let prev_idx = prev_view.col(prev_base);
     let prev_val = prev_view.col(prev_base + 1);
@@ -286,7 +289,7 @@ fn reg_slot_transition(
     for k in 0..col::DIFF_BITS {
         let bit = prev_view.col(bits_base + k);
         c.push(bit * (bit - one));
-        recon = recon + bit * Ext::from_u32(1u32 << k);
+        recon = recon + bit * xf::<X>(1u32 << k);
     }
     c.push(diff - recon);
 
@@ -294,9 +297,9 @@ fn reg_slot_transition(
 }
 
 /// Constraint pack for the sorted memory transition.
-fn mem_slot_transition(curr: &TraceView, next: &TraceView) -> Vec<Ext> {
+fn mem_slot_transition<X: Field>(curr: &TraceView<X>, next: &TraceView<X>) -> Vec<X> {
     let mut c = Vec::new();
-    let one = Ext::one();
+    let one = X::ONE;
 
     let prev_addr = curr.col(col::SMEM);
     let prev_val  = curr.col(col::SMEM + 1);
@@ -326,7 +329,7 @@ fn mem_slot_transition(curr: &TraceView, next: &TraceView) -> Vec<Ext> {
     for k in 0..col::DIFF_BITS {
         let bit = curr.col(col::DIFF_BITS_M + k);
         c.push(bit * (bit - one));
-        recon = recon + bit * Ext::from_u32(1u32 << k);
+        recon = recon + bit * xf::<X>(1u32 << k);
     }
     c.push(diff - recon);
 
@@ -342,8 +345,8 @@ fn mem_slot_transition(curr: &TraceView, next: &TraceView) -> Vec<Ext> {
     c
 }
 
-pub fn num_transition_constraints() -> usize {
-    let dummy = TraceView { vals: vec![Ext::zero(); NUM_TRACE_COLS] };
+pub fn num_transition_constraints<X: Field>() -> usize {
+    let dummy = TraceView::<X> { vals: vec![X::ZERO; NUM_TRACE_COLS] };
     eval_transition_constraints(&dummy, &dummy).len()
 }
 
@@ -352,9 +355,9 @@ pub fn num_transition_constraints() -> usize {
 // inactive (and thereby idx/val/wr = 0) by OPCODE_SLOT_ACTIVITY +
 // SLOT_INACTIVE_ZEROED, so these helpers only pin the *active* slots.
 
-fn arith_constraints(curr: &TraceView) -> Vec<Ext> {
+fn arith_constraints<X: Field>(curr: &TraceView<X>) -> Vec<X> {
     let mut c = Vec::new();
-    let one = Ext::one();
+    let one = X::ONE;
     let op_a = curr.col(col::OP_A);
     let op_b = curr.col(col::OP_B);
     let op_c = curr.col(col::OP_C);
@@ -395,9 +398,9 @@ fn arith_constraints(curr: &TraceView) -> Vec<Ext> {
     c
 }
 
-fn jump_constraints(curr: &TraceView) -> Vec<Ext> {
+fn jump_constraints<X: Field>(curr: &TraceView<X>) -> Vec<X> {
     let mut c = Vec::new();
-    let one = Ext::one();
+    let one = X::ONE;
     let pc = curr.col(col::PC);
     let next_pc = curr.col(col::NEXT_PC);
     let op_a = curr.col(col::OP_A);
@@ -427,9 +430,9 @@ fn jump_constraints(curr: &TraceView) -> Vec<Ext> {
     c
 }
 
-fn memory_op_constraints(curr: &TraceView) -> Vec<Ext> {
+fn memory_op_constraints<X: Field>(curr: &TraceView<X>) -> Vec<X> {
     let mut c = Vec::new();
-    let one = Ext::one();
+    let one = X::ONE;
     let op_a = curr.col(col::OP_A);
     let op_b = curr.col(col::OP_B);
 
@@ -457,9 +460,9 @@ fn memory_op_constraints(curr: &TraceView) -> Vec<Ext> {
     c
 }
 
-fn io_constraints(curr: &TraceView) -> Vec<Ext> {
+fn io_constraints<X: Field>(curr: &TraceView<X>) -> Vec<X> {
     let mut c = Vec::new();
-    let one = Ext::one();
+    let one = X::ONE;
     let op_a = curr.col(col::OP_A);
 
     // READ rd: slot C writes rd (= op_a).
@@ -481,23 +484,23 @@ pub mod permutation {
     use super::*;
 
     /// Canonical register access time (base field): t = clk*3 + slot.
-    fn reg_main_time_base(clk: BabyBear, slot: usize) -> BabyBear {
-        clk * BabyBear::from_u32(3) + BabyBear::from_u32(slot as u32)
+    fn reg_main_time_base<B: Field>(clk: B, slot: usize) -> B {
+        clk * B::from_u64(3) + B::from_u64(slot as u64)
     }
 
     /// Compute all 4-channel accumulator columns over the extension field, from
     /// the base-field trace columns. Layout matches `accum::*`.
-    pub fn compute_accumulators(
-        columns: &[Vec<BabyBear>],
-        gammas: &[Ext; 4],
-        alphas: &[Ext; 4],
-    ) -> Vec<Vec<Ext>> {
+    pub fn compute_accumulators<B: Field, X: ExtField<B>>(
+        columns: &[Vec<B>],
+        gammas: &[X; 4],
+        alphas: &[X; 4],
+    ) -> Vec<Vec<X>> {
         let n = columns[0].len();
 
-        let mut accums: Vec<Vec<Ext>> = (0..NUM_ACCUM_COLS)
+        let mut accums: Vec<Vec<X>> = (0..NUM_ACCUM_COLS)
             .map(|j| {
-                let init = if j < accum::PROG { Ext::one() } else { Ext::zero() };
-                let mut col = vec![Ext::zero(); n];
+                let init = if j < accum::PROG { X::ONE } else { X::ZERO };
+                let mut col = vec![X::ZERO; n];
                 col[0] = init;
                 col
             })
@@ -508,9 +511,9 @@ pub mod permutation {
             let a = alphas[ch];
             // Compress a tuple of base-field values into Ext using the Ext
             // challenge `a` (Horner in `a`), via cheap base-scalar multiplies.
-            let compress = |vals: &[BabyBear]| -> Ext {
-                let mut acc = Ext::zero();
-                let mut ap = Ext::one();
+            let compress = |vals: &[B]| -> X {
+                let mut acc = X::ZERO;
+                let mut ap = X::ONE;
                 for &v in vals { acc = acc + ap.mul_base(v); ap = ap * a; }
                 acc
             };
@@ -518,7 +521,7 @@ pub mod permutation {
             for i in 0..n - 1 {
                 // ── register file (grand product, 3 slots / row) ──
                 let clk = columns[col::CLK][i];
-                let mut num = Ext::one();
+                let mut num = X::ONE;
                 for (slot, &(b_idx, b_val, b_wr)) in [
                     (col::REG_A_IDX, col::REG_A_VAL, col::REG_A_WR),
                     (col::REG_B_IDX, col::REG_B_VAL, col::REG_B_WR),
@@ -530,7 +533,7 @@ pub mod permutation {
                     ]);
                     num = num * (t + g);
                 }
-                let mut den = Ext::one();
+                let mut den = X::ONE;
                 for &base in &[col::SREG_A, col::SREG_B, col::SREG_C] {
                     let t = compress(&[
                         columns[base    ][i], columns[base + 1][i],
@@ -567,7 +570,7 @@ pub mod permutation {
                 ]);
                 let mult = columns[col::PROG + 5][i];
                 let exec_term = (exec + g).inverse();
-                let rom_term = if mult.is_zero() { Ext::zero() } else { (rom + g).inverse().mul_base(mult) };
+                let rom_term = if mult.is_zero() { X::ZERO } else { (rom + g).inverse().mul_base(mult) };
                 accums[accum::PROG + ch][i + 1] = accums[accum::PROG + ch][i] + exec_term - rom_term;
 
                 // ── public input (LogUp) ──
@@ -575,8 +578,8 @@ pub mod permutation {
                 let exec_in = compress(&[columns[col::I_IN][i], columns[col::REG_C_VAL][i]]);
                 let tab_in = compress(&[columns[col::PUB_IN][i], columns[col::PUB_IN + 1][i]]);
                 let tab_in_m = columns[col::PUB_IN + 2][i];
-                let et = if sel_read.is_zero() { Ext::zero() } else { (exec_in + g).inverse().mul_base(sel_read) };
-                let tt = if tab_in_m.is_zero() { Ext::zero() } else { (tab_in + g).inverse().mul_base(tab_in_m) };
+                let et = if sel_read.is_zero() { X::ZERO } else { (exec_in + g).inverse().mul_base(sel_read) };
+                let tt = if tab_in_m.is_zero() { X::ZERO } else { (tab_in + g).inverse().mul_base(tab_in_m) };
                 accums[accum::PUB_IN + ch][i + 1] = accums[accum::PUB_IN + ch][i] + et - tt;
 
                 // ── public output (LogUp) ──
@@ -584,8 +587,8 @@ pub mod permutation {
                 let exec_out = compress(&[columns[col::I_OUT][i], columns[col::REG_A_VAL][i]]);
                 let tab_out = compress(&[columns[col::PUB_OUT][i], columns[col::PUB_OUT + 1][i]]);
                 let tab_out_m = columns[col::PUB_OUT + 2][i];
-                let et = if sel_write.is_zero() { Ext::zero() } else { (exec_out + g).inverse().mul_base(sel_write) };
-                let tt = if tab_out_m.is_zero() { Ext::zero() } else { (tab_out + g).inverse().mul_base(tab_out_m) };
+                let et = if sel_write.is_zero() { X::ZERO } else { (exec_out + g).inverse().mul_base(sel_write) };
+                let tt = if tab_out_m.is_zero() { X::ZERO } else { (tab_out + g).inverse().mul_base(tab_out_m) };
                 accums[accum::PUB_OUT + ch][i + 1] = accums[accum::PUB_OUT + ch][i] + et - tt;
             }
         }
@@ -593,28 +596,28 @@ pub mod permutation {
         accums
     }
 
-    pub fn eval_accum_constraints(
-        curr: &TraceView,
-        _next: &TraceView,
-        curr_acc: &[Ext],
-        next_acc: &[Ext],
-        gammas: &[Ext; 4],
-        alphas: &[Ext; 4],
-    ) -> Vec<Ext> {
+    pub fn eval_accum_constraints<X: Field>(
+        curr: &TraceView<X>,
+        _next: &TraceView<X>,
+        curr_acc: &[X],
+        next_acc: &[X],
+        gammas: &[X; 4],
+        alphas: &[X; 4],
+    ) -> Vec<X> {
         let mut c = Vec::new();
-        let one = Ext::one();
+        let one = X::ONE;
 
         for ch in 0..NUM_CHANNELS {
             let g = gammas[ch];
             let a = alphas[ch];
-            let compress = |vals: &[Ext]| -> Ext {
-                let mut acc = Ext::zero();
-                let mut ap = Ext::one();
+            let compress = |vals: &[X]| -> X {
+                let mut acc = X::ZERO;
+                let mut ap = X::ONE;
                 for &v in vals { acc = acc + v * ap; ap = ap * a; }
                 acc
             };
             // Register access time t = clk*3 + slot, in the extension field.
-            let reg_time = |clk: Ext, slot: usize| clk * Ext::from_u32(3) + Ext::from_u32(slot as u32);
+            let reg_time = |clk: X, slot: usize| clk * xf::<X>(3) + xf::<X>(slot as u32);
 
             // ── reg-file (GP) ──
             let clk = curr.col(col::CLK);
@@ -695,18 +698,18 @@ pub mod permutation {
 /// Convenience for the prover: validate a trace against the AIR before
 /// running the proof pipeline. `columns` are base-field; `accum_columns` are
 /// extension-field.
-pub fn validate_full_trace(
-    columns: &[Vec<BabyBear>],
-    accum_columns: &[Vec<Ext>],
-    gammas: &[Ext; 4],
-    alphas: &[Ext; 4],
+pub fn validate_full_trace<B: Field, X: ExtField<B>>(
+    columns: &[Vec<B>],
+    accum_columns: &[Vec<X>],
+    gammas: &[X; 4],
+    alphas: &[X; 4],
 ) -> Result<(), String> {
     let n = columns[0].len();
 
     // Main transition constraints, with last-row exception.
     for row in 0..n - 1 {
-        let curr = TraceView::from_base(&columns.iter().map(|c| c[row]).collect::<Vec<_>>());
-        let next = TraceView::from_base(&columns.iter().map(|c| c[row + 1]).collect::<Vec<_>>());
+        let curr = TraceView::<X>::from_base(&columns.iter().map(|c| c[row]).collect::<Vec<_>>());
+        let next = TraceView::<X>::from_base(&columns.iter().map(|c| c[row + 1]).collect::<Vec<_>>());
         let cv = eval_transition_constraints(&curr, &next);
         for (j, &v) in cv.iter().enumerate() {
             if !v.is_zero() {
@@ -717,11 +720,11 @@ pub fn validate_full_trace(
 
     // Accumulator constraints, all wrap-around.
     for row in 0..n {
-        let curr = TraceView::from_base(&columns.iter().map(|c| c[row]).collect::<Vec<_>>());
+        let curr = TraceView::<X>::from_base(&columns.iter().map(|c| c[row]).collect::<Vec<_>>());
         let next_row = if row + 1 < n { row + 1 } else { 0 };
-        let next = TraceView::from_base(&columns.iter().map(|c| c[next_row]).collect::<Vec<_>>());
-        let curr_acc: Vec<Ext> = accum_columns.iter().map(|c| c[row]).collect();
-        let next_acc: Vec<Ext> = accum_columns.iter().map(|c| c[next_row]).collect();
+        let next = TraceView::<X>::from_base(&columns.iter().map(|c| c[next_row]).collect::<Vec<_>>());
+        let curr_acc: Vec<X> = accum_columns.iter().map(|c| c[row]).collect();
+        let next_acc: Vec<X> = accum_columns.iter().map(|c| c[next_row]).collect();
         let cv = permutation::eval_accum_constraints(&curr, &next, &curr_acc, &next_acc, gammas, alphas);
         for (j, &v) in cv.iter().enumerate() {
             if !v.is_zero() {
@@ -744,12 +747,12 @@ mod tests {
             Instruction { op: Opcode::Write, a: 1, b: 0, c: 0 },
             Instruction { op: Opcode::Halt,  a: 0, b: 0, c: 0 },
         ];
-        let (records, outputs) = run(&program, &[], 1 << 20).unwrap();
-        build_columns(&records, &program, &[], &outputs)
+        let (records, outputs) = run(&program, &[], 1 << 20, zkvm_core::P).unwrap();
+        build_columns::<BabyBear>(&records, &program, &[], &outputs)
     }
 
-    fn view(cols: &[Vec<BabyBear>], row: usize) -> TraceView {
-        TraceView::from_base(&cols.iter().map(|c| c[row]).collect::<Vec<_>>())
+    fn view(cols: &[Vec<BabyBear>], row: usize) -> TraceView<Ext> {
+        TraceView::<Ext>::from_base(&cols.iter().map(|c| c[row]).collect::<Vec<_>>())
     }
 
     fn assert_all_zero(cols: &[Vec<BabyBear>]) {

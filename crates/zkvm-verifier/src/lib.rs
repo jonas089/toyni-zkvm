@@ -92,7 +92,7 @@ impl ZkvmVerifier {
 
         transcript.absorb_commitment(&proof.accum_commitment);
 
-        let num_main = num_transition_constraints();
+        let num_main = num_transition_constraints::<Ext>();
         let num_accum = permutation::num_accum_constraints();
         let total_constraints = num_main + num_accum;
         let num_b_first = 5 + 5 * NUM_CHANNELS + 2;
@@ -118,8 +118,8 @@ impl ZkvmVerifier {
         let one = Ext::one();
         let entry_pc_f = Ext::from_u32(proof.entry_pc);
 
-        let curr_z = TraceView { vals: proof.trace_at_z.clone() };
-        let next_gz = TraceView { vals: proof.trace_at_gz.clone() };
+        let curr_z = TraceView::<Ext> { vals: proof.trace_at_z.clone() };
+        let next_gz = TraceView::<Ext> { vals: proof.trace_at_gz.clone() };
 
         let main_cv = eval_transition_constraints(&curr_z, &next_gz);
         let accum_cv = permutation::eval_accum_constraints(

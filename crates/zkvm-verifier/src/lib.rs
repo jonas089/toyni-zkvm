@@ -279,16 +279,14 @@ impl ZkvmVerifier {
             if qp.index != qi { return false; }
             if qp.fri_openings.len() != expected_folds - 1 { return false; }
 
-            if !verify_row_opening(&qp.trace_opening, &proof.trace_commitment, num_cols) { return false; }
+            if !verify_row_opening(&qp.trace_opening, &proof.trace_commitment, num_cols, qi, lde_size) { return false; }
             let idx_g = (qi + BLOWUP) % lde_size;
-            if qp.trace_opening_g.index != idx_g { return false; }
-            if !verify_row_opening(&qp.trace_opening_g, &proof.trace_commitment, num_cols) { return false; }
-            if !verify_row_opening_ext(&qp.accum_opening, &proof.accum_commitment, num_accum_cols) { return false; }
-            if qp.accum_opening_g.index != idx_g { return false; }
-            if !verify_row_opening_ext(&qp.accum_opening_g, &proof.accum_commitment, num_accum_cols) { return false; }
-            if !verify_scalar_opening(&qp.quotient_opening, &proof.quotient_commitment) { return false; }
-            if !verify_scalar_opening(&qp.deep_opening, &proof.fri_commitments[0]) { return false; }
-            if !verify_scalar_opening(&qp.deep_opening_pair, &proof.fri_commitments[0]) { return false; }
+            if !verify_row_opening(&qp.trace_opening_g, &proof.trace_commitment, num_cols, idx_g, lde_size) { return false; }
+            if !verify_row_opening_ext(&qp.accum_opening, &proof.accum_commitment, num_accum_cols, qi, lde_size) { return false; }
+            if !verify_row_opening_ext(&qp.accum_opening_g, &proof.accum_commitment, num_accum_cols, idx_g, lde_size) { return false; }
+            if !verify_scalar_opening(&qp.quotient_opening, &proof.quotient_commitment, qi, lde_size) { return false; }
+            if !verify_scalar_opening(&qp.deep_opening, &proof.fri_commitments[0], qi, lde_size) { return false; }
+            if !verify_scalar_opening(&qp.deep_opening_pair, &proof.fri_commitments[0], qi + first_layer_half, lde_size) { return false; }
 
             // x is base; z, g·z are extension.
             let x_i = Ext::from(shifted_elements[qi]);
@@ -339,8 +337,8 @@ impl ZkvmVerifier {
                 let in_first_half = pos == lo;
 
                 let (ref op, ref op_pair) = qp.fri_openings[layer];
-                if !verify_scalar_opening(op, &proof.fri_commitments[fold_k]) { return false; }
-                if !verify_scalar_opening(op_pair, &proof.fri_commitments[fold_k]) { return false; }
+                if !verify_scalar_opening(op, &proof.fri_commitments[fold_k], lo, layer_size) { return false; }
+                if !verify_scalar_opening(op_pair, &proof.fri_commitments[fold_k], lo + half, layer_size) { return false; }
 
                 if in_first_half {
                     if op.value != prev_folded { return false; }
@@ -365,25 +363,48 @@ impl ZkvmVerifier {
     }
 }
 
-fn verify_row_opening(opening: &MerkleOpening, root: &[u8], num_cols: usize) -> bool {
+/// The `index`/`num_leaves` pair is what binds an opening to the position the
+/// transcript asked about: `verify_merkle_proof` derives the left/right turns
+/// from the index, so a path for another position cannot verify.
+fn verify_row_opening(
+    opening: &MerkleOpening,
+    root: &[u8],
+    num_cols: usize,
+    index: usize,
+    num_leaves: usize,
+) -> bool {
     if opening.values.len() != num_cols { return false; }
+    if opening.index != index { return false; }
     let mut h = Sha256::new();
     for v in &opening.values { h.update(v.to_bytes()); }
     let leaf = h.finalize().to_vec();
-    verify_merkle_proof(leaf, &opening.proof, &root.to_vec())
+    verify_merkle_proof(&leaf, index, num_leaves, &opening.proof, root)
 }
 
-fn verify_row_opening_ext(opening: &MerkleOpeningExt, root: &[u8], num_cols: usize) -> bool {
+fn verify_row_opening_ext(
+    opening: &MerkleOpeningExt,
+    root: &[u8],
+    num_cols: usize,
+    index: usize,
+    num_leaves: usize,
+) -> bool {
     if opening.values.len() != num_cols { return false; }
+    if opening.index != index { return false; }
     let mut h = Sha256::new();
     for v in &opening.values { h.update(v.to_bytes()); }
     let leaf = h.finalize().to_vec();
-    verify_merkle_proof(leaf, &opening.proof, &root.to_vec())
+    verify_merkle_proof(&leaf, index, num_leaves, &opening.proof, root)
 }
 
-fn verify_scalar_opening(opening: &ScalarOpening, root: &[u8]) -> bool {
+fn verify_scalar_opening(
+    opening: &ScalarOpening,
+    root: &[u8],
+    index: usize,
+    num_leaves: usize,
+) -> bool {
+    if opening.index != index { return false; }
     let leaf = opening.value.to_bytes().to_vec();
-    verify_merkle_proof(leaf, &opening.proof, &root.to_vec())
+    verify_merkle_proof(&leaf, index, num_leaves, &opening.proof, root)
 }
 
 /// Recompute the Merkle root of an Ext-valued layer, matching the prover's

@@ -327,7 +327,7 @@ the audited code plus the patches in `REMEDIATION.md` (AUTH-01, AUTH-02, AUTH-03
 | AUTH-01 | Critical | Fixed (f01 rejected) |
 | AUTH-02 | Critical | Fixed (f02 rejected) |
 | AUTH-03 | High | Fixed (f03 rejected) |
-| AUTH-04 | High | **Open.** The README rule ("the chain checks each `c` was logged before the batch") still allows the substitution. A chain built on it must accept, per anchor, only the first commitment logged by the anchor's owner (Section 4). |
+| AUTH-04 | High | **Open.** The README rule ("the chain checks each `c` was logged before the batch") still allows the substitution. A chain built on it must accept, per anchor, only the first commitment logged by the anchor's owner (Section 4). Even with that fixed, in-flight transactions depend on the sequencer; see `TRUST-ASSUMPTIONS.md`. |
 | AUTH-05 | Medium | Fixed (queries sampled over the whole domain) |
 | AUTH-08 | Low | Fixed (zero-knowledge: trace masks plus an FRI randomizer) |
 
@@ -350,6 +350,17 @@ the audited code plus the patches in `REMEDIATION.md` (AUTH-01, AUTH-02, AUTH-03
   - the randomizer is committed before the DEEP coefficients and checked at every query;
   - changing its opening or commitment is rejected;
   - an honest proof built through the PoC forger still verifies, and f01–f03 are still rejected.
+
+**Second re-audit (after AUTH-08 and TOYNI-06).** An independent review of the zero-knowledge change found no Critical, High
+or Medium issue. Tests ran in a scratch copy:
+- Honest proofs verified at batch sizes 1, 5, 300 and 600, with queries in both halves.
+- All 3,334 mutations of the new fields were rejected (randomizer root and opening, pair value, `+p` encodings, index and
+  path, swapped or reused openings).
+- A malicious prover with one bad trace cell was rejected for every choice of randomizer: honest, `R = −Q`, and a random
+  function that is not low degree. Only an *honest* trace with `R = −Q` verifies. That statement is true and the proof valid;
+  such a prover only gives up its own zero-knowledge.
+- For each witness column, the 136 revealed linear functions of its 268 mask coefficients have full rank on a real proof, so
+  the revealed trace values are uniform. The randomizer makes every DEEP and FRI value simulatable.
 
 ## Appendix A: Soundness estimates
 

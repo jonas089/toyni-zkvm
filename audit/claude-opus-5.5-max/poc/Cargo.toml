@@ -1,0 +1,18 @@
+[package]
+name = "auth-audit-poc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone workspace so the PoCs never become part of the audited build.
+[workspace]
+
+[dependencies]
+auth-air = { path = "../../../crates/auth-air" }
+toyni = { git = "https://github.com/jonas089/toyni" }
+rand = "0.8.5"
+rayon = "1.10"
+sha2 = "0.10.8"
+
+[patch."https://github.com/jonas089/toyni"]
+toyni = { path = "../../../../toyni" }

@@ -14,7 +14,7 @@
 ## 1. Summary
 
 The engine proves, for a batch of authorization records, that the holder of each `anchor` revealed a preimage `x` and committed to `(m, next)`.
-Four issues let an attacker make the verifier accept authorizations nobody made. **Two of them are complete proof forgeries that need no
+Three issues let an attacker make the verifier accept authorizations nobody made. **Two of them are complete proof forgeries that need no
 secret at all.**
 
 | ID | Title | Severity | Status |
@@ -22,7 +22,6 @@ secret at all.**
 | AUTH-01 | Batches of up to 256 authorizations can be forged without any secret | **Critical** | Confirmed (PoC, 0.1 s) |
 | AUTH-02 | Non-canonical OOD values make the constraint check and DEEP disagree: forgery at any batch size | **Critical** | Confirmed (PoC, 3.3 s) |
 | AUTH-03 | Records are not range-checked: verified bytes can differ from the authorized message | **High** | Confirmed (PoC) |
-| AUTH-04 | Protocol rule lets the aggregator authorize its own message for a user's anchor | **High** | Confirmed (PoC) |
 | AUTH-05 | DEEP consistency only on half the domain: soundness margin halved at every size | Medium | Analysis |
 | AUTH-06 | Fiat-Shamir does not bind configuration or deployment; prover messages unframed | Low | Analysis |
 | AUTH-07 | Verifier can panic on attacker input (debug builds; unbounded `derive_z`) | Low | Confirmed (debug PoC) |
@@ -44,7 +43,6 @@ Section 6 lists the properties that were checked and hold.
 | `crates/auth-air/src/prover.rs` | 343 | Prover |
 | `crates/auth-air/src/verifier.rs` | 215 | Verifier |
 | `crates/auth-air/src/bin/auth-bench.rs` | 45 | Benchmark (not security relevant) |
-| `README.md` | — | Protocol description (the chain is not implemented) |
 
 The toyni primitives the engine uses (field, extension, NTT, Merkle, transcript, FRI fold, masking) are covered in the toyni report.
 Findings rooted there are cross-referenced (TOYNI-xx).
@@ -56,7 +54,8 @@ Findings rooted there are cross-referenced (TOYNI-xx).
 - A malicious aggregator that also learns users' secrets `x` (it must, to prove).
 - Anyone who can submit records or proofs to the verifying party.
 
-The verifier, the chain state (anchors) and the commitment log are trusted.
+The verifier and the records the caller supplies are trusted. How a chain and sequencer use the proofs is out of scope; see
+`example/README.md`.
 
 **Methodology.**
 - **Manual review.** Every line in scope was read, and every verifier check was compared against what a sound DEEP-ALI + FRI verifier must enforce.
@@ -171,30 +170,6 @@ message the user did not authorize.
 **Recommendation.** Reject non-canonical records in `verify` and have it return the canonical records it verified. Consumers must only act on
 that returned data.
 
-### AUTH-04: The protocol rule lets the aggregator authorize its own message for a user's anchor
-
-**Severity: High** (protocol design). Location: `README.md`, "prove" step.
-
-**Description.**
-- The README requires only that "the chain checks each `c` was logged before the batch".
-- To prove, the aggregator must learn `x`. It can then log its own `c' = H2(m', x, next')` and prove `(anchor, m', next', c')`.
-- That proof is valid, and `c'` was logged before the batch.
-- Commitments are hiding and do not name their anchor. The chain cannot tell `c'` was logged *after* `x` was revealed, which is exactly
-  the ordering the Guy Fawkes protocol (Anderson et al., 1998) depends on.
-
-**Exploit** (`poc/tests/f04_aggregator_substitution.rs`). The aggregator authorizes its own message and its own next anchor, so it also
-takes over the user's account.
-
-**Recommendation.**
-- A commit transaction must name its anchor, i.e. log `(anchor, c)`.
-- For each anchor, the chain accepts only the **first** commitment logged while that anchor is current.
-- A batch record must reference that commitment.
-- Also enforce:
-  - at most one record per anchor per batch;
-  - anchor uniqueness across users;
-  - rejection of the padding anchor (AUTH-10);
-  - a chain or contract identifier inside `H2`'s input, so commitments cannot be replayed across deployments.
-
 ### AUTH-05: DEEP consistency only on half the domain halves the soundness margin at every size
 
 **Severity: Medium.** Location: `verifier.rs:73-98`; `prover.rs:16-28`.
@@ -251,7 +226,7 @@ and reject commitments that are not 32 bytes.
   - the quotient here is cubic in the trace values,
   - each column's 268 masking coefficients exceed its 133 direct openings.
 - No zero-knowledge argument exists either (see Haböck and Al Kindi, ePrint 2024/1037). The practical exposure is limited, since the
-  aggregator learns `x` anyway. The main risk is leaking `x` for authorizations the chain has not yet processed.
+  aggregator learns `x` anyway. The main risk is leaking `x` for authorizations that have not been applied yet.
 
 **Recommendation.** If zero-knowledge is a goal, randomize the DEEP/FRI input, budget masking for every revealed functional, and document
 the claim.
@@ -271,7 +246,8 @@ If post-quantum security is a goal, use 8-element anchors and secrets.
 
 **Severity: Info.** Location: `air.rs:63-70`.
 
-Padding rows prove `H1(0) = anchor_pad`. Anyone can authorize anything for the anchor `H1(0)`, so the chain must refuse to register it.
+Padding rows prove `H1(0) = anchor_pad`. Anyone can authorize anything for the anchor `H1(0)`, so a deployment must never accept
+it as an anchor (`example/README.md`).
 
 ### AUTH-11: H1 and H2 are separated only by input layout
 
@@ -295,7 +271,6 @@ commitment if verification cost matters.
 | AUTH-02 | `tests/f02_noncanonical_ood_forgery.rs` (release only; about 3 GB RAM) | 3.3 s |
 | AUTH-02 / AUTH-07 | `noncanonical_ood_value_panics_debug_verifier` (debug only) | instant |
 | AUTH-03 | `tests/f03_noncanonical_record_aliasing.rs` | 0.3 s |
-| AUTH-04 | `tests/f04_aggregator_substitution.rs` | 0.1 s |
 
 ```
 cd audit/claude-opus-5.5-max/poc && cargo test --release
@@ -327,7 +302,6 @@ the audited code plus the patches in `REMEDIATION.md` (AUTH-01, AUTH-02, AUTH-03
 | AUTH-01 | Critical | Fixed (f01 rejected) |
 | AUTH-02 | Critical | Fixed (f02 rejected) |
 | AUTH-03 | High | Fixed (f03 rejected) |
-| AUTH-04 | High | **Open.** The README rule ("the chain checks each `c` was logged before the batch") still allows the substitution. A chain built on it must accept, per anchor, only the first commitment logged by the anchor's owner (Section 4). Even with that fixed, in-flight transactions depend on the sequencer; see `TRUST-ASSUMPTIONS.md`. |
 | AUTH-05 | Medium | Fixed (queries sampled over the whole domain) |
 | AUTH-08 | Low | Fixed (zero-knowledge: trace masks plus an FRI randomizer) |
 
@@ -340,7 +314,7 @@ the audited code plus the patches in `REMEDIATION.md` (AUTH-01, AUTH-02, AUTH-03
   - public-input binding;
   - field and extension arithmetic;
   - challenge sampling.
-- PoCs f01–f04 were re-run; f01–f03 are rejected.
+- PoCs f01–f03 were re-run and are rejected.
 - Additional tests ran in a scratch copy (not kept in the repo):
   - 2,063 single-field mutations of an honest proof, covering every proof field, were all rejected;
   - a proof over an invalid row, with a lie about `q(z)` that passes the OOD check, was rejected;

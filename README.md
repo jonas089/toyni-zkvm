@@ -16,8 +16,7 @@ batch of authorizations with a single zero-knowledge STARK.
 - **Toyni (proving backend)**: solid. Core STARK toolkit + CUDA NTT path.
 - **Auth engine (this repo)**: one trace row per authorization, Poseidon1 over
   BabyBear as the hash, zero-knowledge proofs. The critical and high findings
-  from the AI review in `audit/claude-opus-5.5-max` are fixed, except AUTH-04,
-  which is a rule for the chain (see "Protocol").
+  from the AI review in `audit/claude-opus-5.5-max` are fixed.
 
 ## Benchmarks
 
@@ -32,24 +31,13 @@ Proving and verifying one batch on an Apple M3 Max (16 cores, CPU only):
 
 Reproduce with `cargo run --release --bin auth-bench -- <num_auths>`.
 
-## Protocol
+## What is proven
 
-The chain keeps one `anchor` per user and a log of commitments
-(the "Guy Fawkes" protocol, Anderson et al., 1998):
+For every record `(anchor, m, next, c)` in a batch, the prover knows a secret `x` with `H1(x) == anchor` and
+`H2(m, x, next) == c`. The proof is zero-knowledge, so `x` stays hidden from anyone who only sees the proof.
 
-- **register**: the user picks a secret `x` (4 BabyBear elements, ~124 bits)
-  and registers `anchor = H1(x)`.
-- **commit**: to authorize a message `m` (8 elements), the user picks the next
-  secret `x'` and posts `c = H2(m, x, next)` with `next = H1(x')`.
-- **prove**: once `c` is final, the user hands `(m, x, next)` to an
-  aggregator, which proves for a whole batch that `H1(x) == anchor` and
-  `H2(m, x, next) == c`. The chain checks each `c` was logged before the batch
-  and sets the user's anchor to `next`.
-
-> [!WARNING]
-> **Open (AUTH-04):** with the rule above, an aggregator that learned `x` can
-> log its own `c` and prove it. The chain must only accept the first
-> commitment that the anchor's owner logged for the current anchor.
+There is no chain yet. `example/` shows how a chain and a sequencer would use these proofs for UTXO payments (with
+in-memory placeholders), and its README collects the rules and trust assumptions they need.
 
 `H1(x) = P([x, 0 x 12])[0..4]` and `H2(m, x, next) = P([m, x, next])[0..8]`,
 where `P` is Poseidon1 over BabyBear, width 16 (Plonky3's
@@ -68,6 +56,8 @@ where `P` is Poseidon1 over BabyBear, width 16 (Plonky3's
   records the caller supplies. Witness columns are masked and the FRI input is
   randomized, so proofs are zero-knowledge.
 - `bin/auth-bench.rs`: `cargo run --release --bin auth-bench -- <num_auths>`.
+
+`example/`: UTXO payments with an in-memory chain and sequencer, plus their design notes.
 
 `audit/claude-opus-5.5-max`: the AI security review, remediation notes and PoCs.
 

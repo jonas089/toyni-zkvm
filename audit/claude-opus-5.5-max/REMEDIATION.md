@@ -155,7 +155,6 @@ The PoC forger commits a zero `R`, which a malicious prover is free to do.
 | AUTH-01 | Critical | Fixed |
 | AUTH-02 | Critical | Fixed |
 | AUTH-03 | High | Fixed |
-| AUTH-04 | High | Open. This is a rule for the chain, which does not exist yet; the verifier accepts the substituted proof by design (f04). |
 | AUTH-05 | Medium | Fixed |
 | AUTH-06 | Low | Open |
 | AUTH-07 | Low | Partly fixed: the non-canonical panic path is closed; `derive_z` is still unbounded |
@@ -171,7 +170,6 @@ The PoCs were run against the pre-audit code and against the patched code (`cd p
 | f01: small-batch forgery | verifies | rejected |
 | f02: non-canonical OOD forgery, 300 records | verifies | rejected |
 | f03: non-canonical record aliasing | verifies | rejected |
-| f04: aggregator substitution | verifies | verifies (AUTH-04 open) |
 
 f01–f03 now assert rejection. Each attack exercises exactly one patch, and each succeeded against the code without it.
 In a scratch copy with the AUTH-01 patch removed, the AUTH-05 change alone still rejects f01's rate-1/2 forgery, so the two

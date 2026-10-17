@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/auth-air",
+    "example",
 ]
 resolver = "2"
 

@@ -1,17 +1,12 @@
 [workspace]
 members = [
-    "crates/zkvm-core",
-    "crates/zkvm-air",
-    "crates/zkvm-prover",
-    "crates/zkvm-verifier",
-    "crates/zkvm-cli",
+    "crates/auth-air",
 ]
 resolver = "2"
 
 [workspace.dependencies]
 toyni = { git = "https://github.com/jonas089/toyni" }
-zkvm-core = { path = "crates/zkvm-core" }
-zkvm-air = { path = "crates/zkvm-air" }
-zkvm-prover = { path = "crates/zkvm-prover" }
-zkvm-verifier = { path = "crates/zkvm-verifier" }
 sha2 = "0.10.8"
+
+[patch."https://github.com/jonas089/toyni"]
+toyni = { path = "../toyni" }

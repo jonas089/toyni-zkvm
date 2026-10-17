@@ -1,0 +1,16 @@
+[package]
+name = "auth-air"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+toyni = { workspace = true }
+sha2 = { workspace = true }
+rand = "0.8.5"
+rayon = "1.10"
+
+[dev-dependencies]
+# Reference Poseidon1 for tests.
+p3-baby-bear = "=0.8.0"
+p3-field = "=0.8.0"
+p3-symmetric = "=0.8.0"

@@ -20,9 +20,19 @@ pub const SBOXES: usize = 2 * HALF_FULL_ROUNDS * WIDTH + PARTIAL_ROUNDS;
 pub trait AirField:
     Copy + Add<Output = Self> + Sub<Output = Self> + Mul<Output = Self> + From<BabyBear>
 {
+    /// `w * self`, used to weight constraints by powers of alpha.
+    fn scaled_by(self, w: Ext) -> Ext;
 }
-impl AirField for BabyBear {}
-impl AirField for Ext {}
+impl AirField for BabyBear {
+    fn scaled_by(self, w: Ext) -> Ext {
+        w.mul_base(self)
+    }
+}
+impl AirField for Ext {
+    fn scaled_by(self, w: Ext) -> Ext {
+        w * self
+    }
+}
 
 /// Rounds 0..4 and 17..21 are full, 4..17 partial.
 pub fn is_full_round(round: usize) -> bool {
@@ -79,6 +89,23 @@ impl Poseidon1 {
             });
         }
         state
+    }
+
+    /// Re-runs the permutation from a trace: each S-box result is read from `sbox_outputs`
+    /// instead of computed. Returns the input every S-box saw, and the final state.
+    pub fn replay<F: AirField>(
+        &self,
+        state: [F; WIDTH],
+        sbox_outputs: &[F; SBOXES],
+    ) -> ([F; SBOXES], [F; WIDTH]) {
+        let mut sbox_inputs = [F::from(BabyBear::zero()); SBOXES];
+        let mut k = 0;
+        let out = self.permute_with(state, |v| {
+            sbox_inputs[k] = v;
+            k += 1;
+            sbox_outputs[k - 1]
+        });
+        (sbox_inputs, out)
     }
 
     pub fn permute(&self, state: [BabyBear; WIDTH]) -> [BabyBear; WIDTH] {

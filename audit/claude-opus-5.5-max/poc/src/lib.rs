@@ -6,8 +6,8 @@ pub mod ktree;
 use auth_air::air::{self, AuthRecord, NUM_COLS, NUM_CONSTRAINTS, NUM_PUBLIC};
 use auth_air::poseidon1::Poseidon1;
 use auth_air::prover::{
-    fri_degree_bound, trace_len_for, AuthProof, QueryProof, RowOpening, ScalarOpening, BLOWUP,
-    COSET_SHIFT, NUM_QUERIES,
+    build_pair_merkle_tree, fri_degree_bound, trace_len_for, AuthProof, FriPairOpening, QueryProof, RowOpening,
+    ScalarOpening, BLOWUP, COSET_SHIFT, NUM_QUERIES,
 };
 use sha2::{Digest, Sha256};
 use toyni::babybear::BabyBear;
@@ -169,7 +169,7 @@ impl Forger {
     pub fn finish(mut self, layer0: Vec<Ext>) -> AuthProof {
         assert_eq!(layer0.len(), self.lde);
         let mut layers = vec![layer0];
-        let mut trees = vec![ext_tree(&layers[0])];
+        let mut trees = vec![build_pair_merkle_tree(&layers[0])];
         let mut fri_commitments = vec![trees[0].root().unwrap()];
         self.transcript.absorb_commitment(&fri_commitments[0]);
         let mut xs = self.xs.clone();
@@ -181,14 +181,13 @@ impl Forger {
             for x in &mut xs {
                 *x = *x * *x;
             }
-            let tree = ext_tree(&folded);
+            let tree = if folded.len() > final_size { build_pair_merkle_tree(&folded) } else { ext_tree(&folded) };
             let root = tree.root().unwrap();
             self.transcript.absorb_commitment(&root);
             fri_commitments.push(root);
             trees.push(tree);
             layers.push(folded);
         }
-        let half0 = self.lde / 2;
         let trace_lde = self.trace_lde.as_ref().unwrap();
         let trace_tree = self.trace_tree.as_ref().unwrap();
         let q_evals = self.q_evals.as_ref().unwrap();
@@ -199,12 +198,16 @@ impl Forger {
             .squeeze_indices(NUM_QUERIES, self.lde)
             .into_iter()
             .map(|qi| {
-                let mut idx = qi;
-                let fri_openings = (1..layers.len() - 1)
-                    .map(|l| {
-                        let half = layers[l].len() / 2;
-                        idx %= half;
-                        (open(&trees[l], &layers[l], idx), open(&trees[l], &layers[l], idx + half))
+                let mut lo = qi;
+                let fri_pairs = (0..layers.len() - 1)
+                    .map(|k| {
+                        let half = layers[k].len() / 2;
+                        lo %= half;
+                        FriPairOpening {
+                            index: lo,
+                            values: [layers[k][lo], layers[k][lo + half]],
+                            proof: trees[k].get_proof(lo).unwrap(),
+                        }
                     })
                     .collect();
                 QueryProof {
@@ -216,9 +219,7 @@ impl Forger {
                     },
                     quotient_opening: open(q_tree, q_evals, qi),
                     randomizer_opening: open(r_tree, r_evals, qi),
-                    deep_opening: open(&trees[0], &layers[0], qi),
-                    deep_opening_pair: open(&trees[0], &layers[0], qi ^ half0),
-                    fri_openings,
+                    fri_pairs,
                 }
             })
             .collect();
@@ -264,13 +265,7 @@ pub fn weights(alpha: Ext) -> Vec<Ext> {
 
 /// sum_k w_k C_k(row), evaluated with toyni's arithmetic (exactly what the verifier computes).
 pub fn combined_constraint(p: &Poseidon1, row: &[Ext], w: &[Ext]) -> Ext {
-    let mut acc = Ext::zero();
-    let mut k = 0;
-    air::eval_constraints(p, row, |v| {
-        acc = acc + w[k] * v;
-        k += 1;
-    });
-    acc
+    air::constraints(p, &air::Row::from_cells(row)).into_iter().zip(w).fold(Ext::zero(), |acc, (c, &wk)| acc + wk * c)
 }
 
 pub fn row_tree(cols: &[Vec<BabyBear>], lde: usize) -> MerkleTree {

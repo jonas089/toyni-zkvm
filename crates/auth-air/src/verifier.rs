@@ -6,12 +6,12 @@ use toyni::math::domain::BabyBearDomain;
 use toyni::merkle::verify_merkle_proof;
 use toyni::transcript::FiatShamirTranscript;
 
-use crate::air::{self, AuthRecord, NUM_COLS, NUM_PUBLIC};
+use crate::air::{AuthRecord, Row, NUM_COLS, NUM_PUBLIC};
 use crate::poseidon1::Poseidon1;
 use crate::prover::{
-    absorb_statement, build_scalar_merkle_tree_ext, constraint_weights, derive_z, fri_degree_bound,
-    public_columns, row_leaf, trace_len_for, AuthProof, RowOpening, ScalarOpening, BLOWUP,
-    COSET_SHIFT, NUM_QUERIES,
+    absorb_statement, build_scalar_merkle_tree_ext, composition, constraint_weights, derive_z, fri_degree_bound,
+    fri_pair_leaf, public_columns, row_leaf, trace_len_for, AuthProof, FriPairOpening, RowOpening, ScalarOpening,
+    BLOWUP, COSET_SHIFT, NUM_QUERIES,
 };
 
 pub fn verify(proof: &AuthProof, records: &[AuthRecord]) -> bool {
@@ -42,12 +42,8 @@ pub fn verify(proof: &AuthProof, records: &[AuthRecord]) -> bool {
         if proof.trace_at_z[c] != lagrange_ext(&pub_cols[c], z, &domain) { return false; }
     }
 
-    let mut c_z = Ext::zero();
-    let mut k = 0;
-    air::eval_constraints(&p, &proof.trace_at_z, |v| {
-        c_z = c_z + weights[k] * v;
-        k += 1;
-    });
+    // The constraint identity at z: C(z) = q(z) * Z_H(z).
+    let c_z = composition(&p, &Row::from_cells(&proof.trace_at_z), &weights);
     let z_h_z = z.pow_u128(trace_len as u128) - Ext::one();
     if c_z != proof.q_z * z_h_z { return false; }
 
@@ -72,21 +68,18 @@ pub fn verify(proof: &AuthProof, records: &[AuthRecord]) -> bool {
         transcript.absorb_commitment(&proof.fri_commitments[i]);
     }
 
-    let half0 = lde_size / 2;
     let query_indices = transcript.squeeze_indices(NUM_QUERIES, lde_size);
     if proof.query_proofs.len() != NUM_QUERIES { return false; }
     let shifted_elements = shifted_domain.elements();
-    let half_inv = BabyBear::new(2).inverse();
 
     for (qp, &qi) in proof.query_proofs.iter().zip(&query_indices) {
         if qp.index != qi { return false; }
-        if qp.fri_openings.len() != expected_folds - 1 { return false; }
+        if qp.fri_pairs.len() != expected_folds { return false; }
         if !verify_row(&qp.trace_opening, &proof.trace_commitment, qi, lde_size) { return false; }
         if !verify_scalar(&qp.quotient_opening, &proof.quotient_commitment, qi, lde_size) { return false; }
         if !verify_scalar(&qp.randomizer_opening, &proof.randomizer_commitment, qi, lde_size) { return false; }
-        if !verify_scalar(&qp.deep_opening, &proof.fri_commitments[0], qi, lde_size) { return false; }
-        if !verify_scalar(&qp.deep_opening_pair, &proof.fri_commitments[0], qi ^ half0, lde_size) { return false; }
 
+        // DEEP value at x, recomputed from the openings: the prediction for layer 0.
         let inv_x_z = (Ext::from(shifted_elements[qi]) - z).inverse();
         let mut expected = Ext::zero();
         for c in 0..NUM_COLS {
@@ -95,35 +88,29 @@ pub fn verify(proof: &AuthProof, records: &[AuthRecord]) -> bool {
         }
         expected = expected + deep_coeffs[NUM_COLS] * (qp.quotient_opening.value - proof.q_z) * inv_x_z;
         expected = expected + deep_coeffs[NUM_COLS + 1] * qp.randomizer_opening.value;
-        if qp.deep_opening.value != expected { return false; }
 
-        // qi ranges over the whole domain; fold with (a0, b0) at (lo0, lo0 + lde/2).
-        let lo0 = qi % half0;
-        let (a0, b0) = if qi == lo0 {
-            (qp.deep_opening.value, qp.deep_opening_pair.value)
-        } else {
-            (qp.deep_opening_pair.value, qp.deep_opening.value)
-        };
-        let mut folded = (a0 + b0).mul_base(half_inv)
-            + (a0 - b0).mul_base(half_inv) * fri_betas[0] * Ext::from(shifted_elements[lo0].inverse());
-        let mut pos = lo0;
-        for (layer, (op, op_pair)) in qp.fri_openings.iter().enumerate() {
-            let fold_k = layer + 1;
-            let layer_size = lde_size >> fold_k;
-            let half = layer_size / 2;
+        // Layer k: the opened value at `pos` must equal the prediction (k = 0: DEEP check,
+        // k > 0: fold check); folding the pair predicts layer k + 1 at `lo`.
+        let mut pos = qi;
+        for (k, pair) in qp.fri_pairs.iter().enumerate() {
+            let half = (lde_size >> k) / 2;
             let lo = pos % half;
-            if !verify_scalar(op, &proof.fri_commitments[fold_k], lo, layer_size) { return false; }
-            if !verify_scalar(op_pair, &proof.fri_commitments[fold_k], lo + half, layer_size) { return false; }
-            let mine = if pos == lo { op.value } else { op_pair.value };
-            if mine != folded { return false; }
-            let x_inv = shifted_elements[lo].pow(1u64 << fold_k).inverse();
-            folded = (op.value + op_pair.value).mul_base(half_inv)
-                + (op.value - op_pair.value).mul_base(half_inv) * fri_betas[fold_k] * Ext::from(x_inv);
+            if !verify_pair(pair, &proof.fri_commitments[k], lo, half) { return false; }
+            let mine = if pos == lo { pair.values[0] } else { pair.values[1] };
+            if mine != expected { return false; }
+            let y = shifted_elements[lo].pow(1u64 << k);
+            expected = fold(pair.values, fri_betas[k], y);
             pos = lo;
         }
-        if proof.fri_final_layer[pos] != folded { return false; }
+        if proof.fri_final_layer[pos] != expected { return false; }
     }
     true
+}
+
+/// f'(y^2) = (f(y) + f(-y)) / 2 + beta * (f(y) - f(-y)) / (2y): even part + beta * odd part.
+fn fold([at_y, at_neg_y]: [Ext; 2], beta: Ext, y: BabyBear) -> Ext {
+    let half_inv = BabyBear::new(2).inverse();
+    (at_y + at_neg_y).mul_base(half_inv) + (at_y - at_neg_y).mul_base(half_inv) * beta * Ext::from(y.inverse())
 }
 
 /// Every field element must be < p: the u32 arithmetic and `==` are wrong otherwise (AUTH-02, AUTH-03).
@@ -136,8 +123,8 @@ fn canonical(proof: &AuthProof, records: &[AuthRecord]) -> bool {
         && proof.fri_final_layer.iter().all(ext_ok)
         && proof.query_proofs.iter().all(|qp| {
             qp.trace_opening.values.iter().all(ok)
-                && [&qp.quotient_opening, &qp.randomizer_opening, &qp.deep_opening, &qp.deep_opening_pair].iter().all(|o| ext_ok(&o.value))
-                && qp.fri_openings.iter().all(|(a, b)| ext_ok(&a.value) && ext_ok(&b.value))
+                && [&qp.quotient_opening, &qp.randomizer_opening].iter().all(|o| ext_ok(&o.value))
+                && qp.fri_pairs.iter().all(|pair| pair.values.iter().all(ext_ok))
         })
 }
 
@@ -150,6 +137,11 @@ fn verify_row(opening: &RowOpening, root: &[u8], index: usize, num_leaves: usize
 fn verify_scalar(opening: &ScalarOpening, root: &[u8], index: usize, num_leaves: usize) -> bool {
     opening.index == index
         && verify_merkle_proof(&opening.value.to_bytes(), index, num_leaves, &opening.proof, root)
+}
+
+fn verify_pair(opening: &FriPairOpening, root: &[u8], index: usize, num_leaves: usize) -> bool {
+    opening.index == index
+        && verify_merkle_proof(&fri_pair_leaf(&opening.values), index, num_leaves, &opening.proof, root)
 }
 
 /// Interpolant of `values` over the trace domain, evaluated at z (barycentric).
@@ -232,6 +224,14 @@ mod tests {
         proof.randomizer_commitment[0] ^= 1;
         assert!(!verify(&proof, &records), "changed randomizer commitment accepted");
         proof.randomizer_commitment[0] ^= 1;
+
+        for k in [0, 3] {
+            let v = &mut proof.query_proofs[7].fri_pairs[k].values[1];
+            *v = *v + one;
+            assert!(!verify(&proof, &records), "changed FRI layer {k} opening accepted");
+            let v = &mut proof.query_proofs[7].fri_pairs[k].values[1];
+            *v = *v - one;
+        }
 
         proof.fri_final_layer[0] = proof.fri_final_layer[0] + one;
         assert!(!verify(&proof, &records), "changed FRI final layer accepted");
